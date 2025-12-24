@@ -48,6 +48,16 @@ pip install -r requirements.txt
 uvicorn backend.app:app --host 0.0.0.0 --port 8000
 ```
 
+## WebUI（React）
+
+```bash
+cd webui
+npm install
+npm run dev
+```
+
+默认访问 `http://localhost:5173`，并通过 `/api` 代理连接后端（`http://localhost:8000`）。
+
 ### 4. 健康检查
 ```bash
 curl http://localhost:8000/health
