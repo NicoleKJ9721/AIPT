@@ -5,7 +5,11 @@ from backend.models import Dataset, SplitConfig
 
 
 def split_dataset(dataset: Dataset, config: SplitConfig) -> Dataset:
-    total_ratio = config.train_ratio + config.val_ratio + config.test_ratio
+    ratios = (config.train_ratio, config.val_ratio, config.test_ratio)
+    if any(ratio < 0 for ratio in ratios):
+        raise ValueError("Split ratios must be non-negative")
+
+    total_ratio = sum(ratios)
     if not math.isclose(total_ratio, 1.0, rel_tol=0.0, abs_tol=1e-6):
         raise ValueError("Split ratios must sum to 1.0")
 

@@ -29,3 +29,10 @@ def test_split_dataset_ratio_validation() -> None:
     config = SplitConfig(train_ratio=0.5, val_ratio=0.3, test_ratio=0.3)
     with pytest.raises(ValueError):
         split_dataset(dataset, config)
+
+
+def test_split_dataset_negative_ratio() -> None:
+    dataset = Dataset(id="d1", name="d1", root="/tmp", items=[])
+    config = SplitConfig(train_ratio=-0.1, val_ratio=0.6, test_ratio=0.5)
+    with pytest.raises(ValueError):
+        split_dataset(dataset, config)
