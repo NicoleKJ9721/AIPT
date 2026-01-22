@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { 
     RotateCw, Sun, Zap, Layers, CloudRain, 
     Save, RotateCcw, ArrowRight,
-    Sliders as SlidersIcon,
     CheckCircle2, Image as ImageIcon,
     Download, EyeOff,
     Pencil,
@@ -83,6 +82,7 @@ const DEFAULT_AUGMENT_CONFIG: AugmentConfig = {
 };
 
 const WEATHER_OPTIONS = ["none", "rain", "snow", "fog"] as const;
+const MANUAL_AUGMENTATION_ENABLED = false;
 
 function baseAugmentConfig(): AugmentConfig {
   return {
@@ -905,15 +905,19 @@ export default function AugmentationConfig() {
   }, [datasetId]);
 
   // Configuration State
-  const [config, setConfig] = useState<AugmentConfig>(() => ({ ...DEFAULT_AUGMENT_CONFIG }));
+  const initialConfig = MANUAL_AUGMENTATION_ENABLED ? DEFAULT_AUGMENT_CONFIG : baseAugmentConfig();
+  const [config, setConfig] = useState<AugmentConfig>(() => ({ ...initialConfig }));
 
   const handleReset = () => {
-    setConfig({ ...DEFAULT_AUGMENT_CONFIG });
+    setConfig({ ...initialConfig });
   };
 
   const [showGuide, setShowGuide] = useState(false);
   const configForPreview: AugmentConfig = useMemo(() => ({ ...config }), [config]);
-  const augmentVariants = useMemo(() => buildAugmentVariants(configForPreview), [configForPreview]);
+  const augmentVariants = useMemo(
+    () => (MANUAL_AUGMENTATION_ENABLED ? buildAugmentVariants(configForPreview) : []),
+    [configForPreview]
+  );
   const baseImageCount = datasetStats?.image_count ?? images.length;
   const predictedImageCount = baseImageCount * (1 + augmentVariants.length);
 
@@ -1027,6 +1031,10 @@ export default function AugmentationConfig() {
 
   // Generate 5 sample previews (for current method tab) for quick visual validation.
   const generateSamplePreviews = useCallback(async () => {
+    if (!MANUAL_AUGMENTATION_ENABLED) {
+      setPreviewSamples([]);
+      return;
+    }
     if (!previewUrl) {
       setPreviewSamples([]);
       return;
@@ -1079,7 +1087,7 @@ export default function AugmentationConfig() {
 
   // Generate CSS transform/filter based on config
   const getImageStyle = () => {
-    if (showOriginal) return {};
+    if (!MANUAL_AUGMENTATION_ENABLED || showOriginal) return {};
 
     const transforms = [
         config.rotate ? `rotate(${config.rotateDeg}deg)` : '',
@@ -1114,7 +1122,7 @@ export default function AugmentationConfig() {
       return;
     }
     if (images.length === 0) {
-      toast({ title: "暂无图片可增强", description: "请先导入图片", variant: "destructive" });
+      toast({ title: "暂无图片可用于快照", description: "请先导入图片", variant: "destructive" });
       return;
     }
     setSnapshotName(activeDataset.name);
@@ -1150,7 +1158,7 @@ export default function AugmentationConfig() {
     try {
       const sources = await imageService.list(projectId, { dataset_id: datasetId });
       if (sources.length === 0) {
-        toast({ title: "暂无图片可增强", variant: "destructive" });
+        toast({ title: "暂无图片可用于快照", variant: "destructive" });
         return;
       }
 
@@ -1169,12 +1177,25 @@ export default function AugmentationConfig() {
 
       toast({
         title: "已创建数据集快照",
-        description: `${created.name} ${created.version}（正在生成增强样本…）`,
+        description: MANUAL_AUGMENTATION_ENABLED
+          ? `${created.name} ${created.version}（正在生成增强样本…）`
+          : `${created.name} ${created.version}`,
       });
 
       const nextDatasets = await datasetService.list({ project_id: projectId, limit: 200 });
       setDatasets(nextDatasets);
       setDataset(created.id, `${created.name} ${created.version}`);
+
+      if (!MANUAL_AUGMENTATION_ENABLED) {
+        const [finalImages, stats] = await Promise.all([
+          imageService.list(projectId, { dataset_id: created.id }),
+          datasetService.getImageStats(created.id),
+        ]);
+        setImages(finalImages);
+        setDatasetStats(stats);
+        toast({ title: "快照生成完成", description: `已生成快照（共 ${finalImages.length} 张图片）` });
+        return;
+      }
 
       type Task = { filename: string; sources: ImageRecord[]; cfg: AugmentConfig; mosaic?: MosaicMeta; fileId?: string };
       const tasks = new Map<string, Task>();
@@ -1379,7 +1400,7 @@ export default function AugmentationConfig() {
             <Card className="w-full max-w-4xl shadow-2xl h-[80vh] flex flex-col">
                 <CardHeader className="border-b">
                     <div className="flex justify-between items-center">
-                        <CardTitle>数据增强操作流程说明</CardTitle>
+                        <CardTitle>数据集快照使用说明</CardTitle>
                         <Button variant="ghost" onClick={() => setShowGuide(false)}>×</Button>
                     </div>
                 </CardHeader>
@@ -1388,12 +1409,12 @@ export default function AugmentationConfig() {
                         <div className="flex items-start gap-6">
                             <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center shrink-0 text-primary font-bold text-xl">1</div>
                             <div className="space-y-4 flex-1">
-                                <h3 className="text-xl font-bold">数据导入 (Data Import)</h3>
-                                <p className="text-muted-foreground">选择需要增强的数据集，支持批量上传图片或引用现有项目数据。</p>
+                                <h3 className="text-xl font-bold">选择数据集 (Select Dataset)</h3>
+                                <p className="text-muted-foreground">选择需要保存为快照的数据集，确保已导入图片并完成必要的标注。</p>
                                 <div className="bg-muted p-4 rounded-lg border border-dashed flex items-center justify-center h-32">
                                     <div className="text-center text-muted-foreground">
                                         <ImageIcon className="w-8 h-8 mx-auto mb-2 opacity-50"/>
-                                        数据集导入示意图
+                                        数据集选择示意图
                                     </div>
                                 </div>
                             </div>
@@ -1406,12 +1427,12 @@ export default function AugmentationConfig() {
                         <div className="flex items-start gap-6">
                             <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center shrink-0 text-primary font-bold text-xl">2</div>
                             <div className="space-y-4 flex-1">
-                                <h3 className="text-xl font-bold">参数配置 (Configuration)</h3>
-                                <p className="text-muted-foreground">调整几何、色彩、噪声等增强参数，实时预览增强效果。</p>
+                                <h3 className="text-xl font-bold">保存快照 (Snapshot)</h3>
+                                <p className="text-muted-foreground">点击“保存为快照”生成新的数据集版本。本平台训练阶段会自动进行数据增广，因此此处仅保留快照/版本固化能力。</p>
                                 <div className="bg-muted p-4 rounded-lg border border-dashed flex items-center justify-center h-32">
                                     <div className="text-center text-muted-foreground">
-                                        <SlidersIcon className="w-8 h-8 mx-auto mb-2 opacity-50"/>
-                                        参数调节示意图
+                                        <Save className="w-8 h-8 mx-auto mb-2 opacity-50"/>
+                                        快照生成示意图
                                     </div>
                                 </div>
                             </div>
@@ -1424,12 +1445,12 @@ export default function AugmentationConfig() {
                         <div className="flex items-start gap-6">
                             <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center shrink-0 text-primary font-bold text-xl">3</div>
                             <div className="space-y-4 flex-1">
-                                <h3 className="text-xl font-bold">生成导出 (Export)</h3>
-                                <p className="text-muted-foreground">应用配置生成增强后的新数据集，并导出为训练格式 (COCO/YOLO)。</p>
+                                <h3 className="text-xl font-bold">训练与部署 (Train/Deploy)</h3>
+                                <p className="text-muted-foreground">使用生成的快照数据集进行模型训练与部署推荐，必要时再导出训练格式。</p>
                                 <div className="bg-muted p-4 rounded-lg border border-dashed flex items-center justify-center h-32">
                                     <div className="text-center text-muted-foreground">
                                         <Download className="w-8 h-8 mx-auto mb-2 opacity-50"/>
-                                        结果导出示意图
+                                        训练/部署示意图
                                     </div>
                                 </div>
                             </div>
@@ -1528,20 +1549,23 @@ export default function AugmentationConfig() {
       <div className="flex items-center justify-between shrink-0">
         <div>
           <h1 className="text-3xl font-bold tracking-tight flex items-center gap-3">
-              数据增强配置 
+              数据集快照
+              <Badge variant="secondary" className="text-xs font-medium">
+                手动增强已禁用
+              </Badge>
               <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => setShowGuide(true)}>
-                  <CheckCircle2 className="w-4 h-4 mr-1"/> 查看操作流程
-              </Button>
-          </h1>
-           <div className="flex items-center gap-2 mt-2 text-sm text-muted-foreground">
-             <span className="flex items-center gap-1"><ImageIcon className="w-3 h-3"/> 数据导入</span>
-             <ArrowRight className="w-3 h-3" />
-             <span className="flex items-center gap-1 font-medium text-primary"><SlidersIcon className="w-3 h-3"/> 增强策略</span>
-             <ArrowRight className="w-3 h-3" />
-             <span className="flex items-center gap-1"><Download className="w-3 h-3"/> 导出结果</span>
-           </div>
-           <div className="flex flex-wrap items-center gap-2 mt-3">
-             <select
+                   <CheckCircle2 className="w-4 h-4 mr-1"/> 查看说明
+               </Button>
+           </h1>
+            <div className="flex items-center gap-2 mt-2 text-sm text-muted-foreground">
+              <span className="flex items-center gap-1"><ImageIcon className="w-3 h-3"/> 选择数据集</span>
+              <ArrowRight className="w-3 h-3" />
+              <span className="flex items-center gap-1 font-medium text-primary"><Save className="w-3 h-3"/> 生成快照</span>
+              <ArrowRight className="w-3 h-3" />
+              <span className="flex items-center gap-1"><Download className="w-3 h-3"/> 用于训练/部署</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 mt-3">
+              <select
                className="h-8 rounded-md border border-input bg-background px-2 py-1 text-sm"
                value={projectId ?? ""}
                disabled={isLoadingProjects || projects.length === 0}
@@ -1592,49 +1616,64 @@ export default function AugmentationConfig() {
                 </span>
                 {datasetId ? (
                   <span className="whitespace-nowrap">
-                    图片：{baseImageCount} · 增强：{augmentVariants.length} · 预计：{predictedImageCount}
+                    图片：{baseImageCount}
+                    {MANUAL_AUGMENTATION_ENABLED ? ` · 增强：${augmentVariants.length} · 预计：${predictedImageCount}` : ""}
                   </span>
                 ) : null}
               </div>
             </div>
           </div>
         <div className="flex gap-2">
-             <Button variant="outline" onClick={handleReset}>
-                 <RotateCcw className="w-4 h-4 mr-2" /> 重置
-             </Button>
-              <Button onClick={openSnapshotDialog} disabled={isApplying || !datasetId || !projectId || images.length === 0}>
-                  <Save className="w-4 h-4 mr-2" /> {isApplying ? "生成中..." : "保存为快照"}
-              </Button>
-          </div>
-        </div>
+             {MANUAL_AUGMENTATION_ENABLED ? (
+               <Button variant="outline" onClick={handleReset}>
+                   <RotateCcw className="w-4 h-4 mr-2" /> 重置
+               </Button>
+             ) : null}
+               <Button onClick={openSnapshotDialog} disabled={isApplying || !datasetId || !projectId || images.length === 0}>
+                   <Save className="w-4 h-4 mr-2" /> {isApplying ? "生成中..." : "保存为快照"}
+               </Button>
+           </div>
+         </div>
 
       <div className="grid grid-cols-12 gap-6 flex-1 min-h-0">
         <div className="col-span-12 xl:col-span-3 flex flex-col gap-4 min-h-0">
           {/* Navigation */}
-          <Card>
-            <CardContent className="p-2 space-y-1">
-              {[
-                { id: "geometric", label: "几何变换", icon: RotateCw },
-                { id: "color", label: "色彩调整", icon: Sun },
-                { id: "noise", label: "噪声注入", icon: Zap },
-                { id: "weather", label: "环境模拟", icon: CloudRain },
-                { id: "advanced", label: "高级增强", icon: Layers },
-              ].map((item) => (
-                <Button
-                  key={item.id}
-                  variant={activeTab === item.id ? "secondary" : "ghost"}
-                  className={`w-full justify-start gap-3 ${activeTab === item.id ? "bg-secondary font-medium" : ""}`}
-                  onClick={() => setActiveTab(item.id)}
-                >
-                  <item.icon className={`w-4 h-4 ${activeTab === item.id ? "text-primary" : "text-muted-foreground"}`} />
-                  {item.label}
-                </Button>
-              ))}
-            </CardContent>
-          </Card>
+          {MANUAL_AUGMENTATION_ENABLED ? (
+            <Card>
+              <CardContent className="p-2 space-y-1">
+                {[
+                  { id: "geometric", label: "几何变换", icon: RotateCw },
+                  { id: "color", label: "色彩调整", icon: Sun },
+                  { id: "noise", label: "噪声注入", icon: Zap },
+                  { id: "weather", label: "环境模拟", icon: CloudRain },
+                  { id: "advanced", label: "高级增强", icon: Layers },
+                ].map((item) => (
+                  <Button
+                    key={item.id}
+                    variant={activeTab === item.id ? "secondary" : "ghost"}
+                    className={`w-full justify-start gap-3 ${activeTab === item.id ? "bg-secondary font-medium" : ""}`}
+                    onClick={() => setActiveTab(item.id)}
+                  >
+                    <item.icon className={`w-4 h-4 ${activeTab === item.id ? "text-primary" : "text-muted-foreground"}`} />
+                    {item.label}
+                  </Button>
+                ))}
+              </CardContent>
+            </Card>
+          ) : (
+            <Card className="border-dashed">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">本模块仅保留快照功能</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm text-muted-foreground">
+                <div>手动数据增强已关闭：YOLO 训练阶段会自动进行数据增广。</div>
+                <div>你仍可将当前数据集保存为新版本快照，用于训练/部署前的版本固化。</div>
+              </CardContent>
+            </Card>
+          )}
 
           {/* Configuration Form */}
-          <Card className="flex flex-col min-h-0 flex-1 overflow-hidden">
+          <Card className={`flex flex-col min-h-0 flex-1 overflow-hidden ${MANUAL_AUGMENTATION_ENABLED ? "" : "hidden"}`}>
           <CardHeader className="border-b bg-muted/20 py-3">
             <CardTitle className="text-lg flex items-center gap-2">
                 {activeTab === "geometric" && <RotateCw className="w-5 h-5" />}
@@ -1808,15 +1847,17 @@ export default function AugmentationConfig() {
                 <div className="flex items-center justify-between">
                     <CardTitle className="text-sm font-medium">实时预览 (Preview)</CardTitle>
                     <div className="flex items-center gap-3">
-                        <label className="flex items-center gap-1 text-xs text-muted-foreground select-none">
-                            <input
-                                type="checkbox"
-                                className="w-4 h-4"
-                                defaultChecked
-                                disabled
-                            />
-                            应用到全部
-                        </label>
+                        {MANUAL_AUGMENTATION_ENABLED ? (
+                          <label className="flex items-center gap-1 text-xs text-muted-foreground select-none">
+                              <input
+                                  type="checkbox"
+                                  className="w-4 h-4"
+                                  defaultChecked
+                                  disabled
+                              />
+                              应用到全部
+                          </label>
+                        ) : null}
                         <Button 
                             variant="outline" 
                             size="sm" 
