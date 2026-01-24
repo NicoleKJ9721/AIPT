@@ -383,6 +383,106 @@ $backgroundScript = {
         return $p
     }
 
+    function Get-NvidiaCudaVersion {
+        try {
+            $exe = (Get-Command nvidia-smi -ErrorAction Stop).Path
+        } catch {
+            return $null
+        }
+
+        try {
+            $out = & $exe 2>$null
+            if ($LASTEXITCODE -ne 0) { return $null }
+            $text = ($out -join "`n")
+            if ($text -match "CUDA Version:\\s*([0-9]+\\.[0-9]+)") {
+                return $Matches[1]
+            }
+        } catch {
+            return $null
+        }
+        return $null
+    }
+
+    function Ensure-CudaTorch {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$PythonExe,
+            [Parameter(Mandatory = $true)]
+            [string]$StdOutPath,
+            [Parameter(Mandatory = $true)]
+            [string]$StdErrPath
+        )
+
+        $cudaText = Get-NvidiaCudaVersion
+        if (-not $cudaText) { return }
+
+        $cudaVer = $null
+        try { $cudaVer = [version]$cudaText } catch { $cudaVer = $null }
+        if (-not $cudaVer) { return }
+
+        $torchVer = $null
+        $cudaAvailable = $false
+        $torchCuda = $null
+        try {
+            $probe = & $PythonExe -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(getattr(torch.version,'cuda',None))" 2>$null
+            $probeLines = @($probe)
+            if ($LASTEXITCODE -eq 0 -and $probeLines.Count -ge 2) {
+                $torchVer = ([string]$probeLines[0]).Trim()
+                $cudaAvailable = ([string]$probeLines[1]).Trim().ToLowerInvariant() -eq "true"
+                if ($probeLines.Count -ge 3) {
+                    $torchCuda = ([string]$probeLines[2]).Trim()
+                }
+            }
+        } catch {
+            $cudaAvailable = $false
+        }
+
+        if ($cudaAvailable) {
+            Log "PyTorch CUDA is available (torch=$torchVer, cuda=$torchCuda)."
+            return
+        }
+
+        $indexUrl = $null
+        if ($cudaVer.Major -gt 12 -or ($cudaVer.Major -eq 12 -and $cudaVer.Minor -ge 1)) {
+            $indexUrl = "https://download.pytorch.org/whl/cu121"
+        } elseif ($cudaVer.Major -eq 12 -and $cudaVer.Minor -eq 0) {
+            $indexUrl = "https://download.pytorch.org/whl/cu118"
+        } elseif ($cudaVer.Major -eq 11 -and $cudaVer.Minor -ge 8) {
+            $indexUrl = "https://download.pytorch.org/whl/cu118"
+        }
+
+        if (-not $indexUrl) {
+            Log "Detected NVIDIA GPU (CUDA $cudaText) but no compatible PyTorch CUDA wheels configured; skip auto-install."
+            return
+        }
+
+        Log "Detected NVIDIA GPU (CUDA $cudaText) but PyTorch CUDA is not available (torch=$torchVer). Installing CUDA-enabled PyTorch..."
+        try {
+            Invoke-Process -FilePath $PythonExe -ArgumentList @("-m", "pip", "install", "--upgrade", "--index-url", $indexUrl, "torch==2.2.*", "torchvision==0.17.*") -StdOutPath $StdOutPath -StdErrPath $StdErrPath | Out-Null
+        } catch {
+            Log "WARNING: Failed to install CUDA-enabled PyTorch. Training may run CPU-only. See logs: $StdOutPath / $StdErrPath"
+            return
+        }
+
+        try {
+            $probe2 = & $PythonExe -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(getattr(torch.version,'cuda',None))" 2>$null
+            $probe2Lines = @($probe2)
+            if ($LASTEXITCODE -eq 0 -and $probe2Lines.Count -ge 2) {
+                $torchVer2 = ([string]$probe2Lines[0]).Trim()
+                $cudaOk2 = ([string]$probe2Lines[1]).Trim().ToLowerInvariant() -eq "true"
+                $torchCuda2 = $null
+                if ($probe2Lines.Count -ge 3) { $torchCuda2 = ([string]$probe2Lines[2]).Trim() }
+                if ($cudaOk2) {
+                    Log "CUDA-enabled PyTorch ready (torch=$torchVer2, cuda=$torchCuda2)."
+                } else {
+                    Log "CUDA-enabled PyTorch installed but CUDA still unavailable (torch=$torchVer2, cuda=$torchCuda2)."
+                }
+            }
+        } catch {
+            # ignore
+        }
+    }
+
     function Start-ProcessDetached {
         param(
             [Parameter(Mandatory = $true)]
@@ -630,6 +730,14 @@ $backgroundScript = {
                 Log "Missing backend dependencies; installing (stdout=$backendInstallLog, stderr=$backendInstallErr)..."
                 Invoke-Process -FilePath $backendPython -ArgumentList @("-m", "pip", "--version") -StdOutPath $backendInstallLog -StdErrPath $backendInstallErr | Out-Null
                 Invoke-Process -FilePath $backendPython -ArgumentList @("-m", "pip", "install", "-r", (Join-Path $sync.Root "backend\\requirements.txt")) -StdOutPath $backendInstallLog -StdErrPath $backendInstallErr | Out-Null
+            }
+
+            # If the machine has an NVIDIA GPU, prefer installing a CUDA-enabled PyTorch wheel.
+            # This keeps the training module GPU-ready even though PyPI defaults to CPU wheels.
+            try {
+                Ensure-CudaTorch -PythonExe $backendPython -StdOutPath $backendInstallLog -StdErrPath $backendInstallErr
+            } catch {
+                Log "WARNING: CUDA PyTorch setup check failed: $($_.Exception.Message)"
             }
             Set-Step 1 ok
             Tick-Progress

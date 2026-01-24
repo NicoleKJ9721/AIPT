@@ -1385,41 +1385,62 @@ def _detect_cpu_device() -> HardwareDeviceOut:
 
 
 def _detect_discrete_gpus() -> list[HardwareDeviceOut]:
+    devices: list[HardwareDeviceOut] = []
+
+    # Prefer torch CUDA introspection if available (includes compute capability, SM count, etc.).
     try:
         import torch  # type: ignore
-    except Exception:
-        return []
 
-    try:
-        if not torch.cuda.is_available():
-            return []
-        devices: list[HardwareDeviceOut] = []
-        for idx in range(int(torch.cuda.device_count() or 0)):
-            props = torch.cuda.get_device_properties(idx)
-            name = str(getattr(props, "name", "")).strip() or f"CUDA GPU {idx}"
-            total_mem = int(getattr(props, "total_memory", 0) or 0)
-            memory = _format_gb(total_mem)
-            cc = None
-            try:
-                cc = f"{int(props.major)}.{int(props.minor)}"
-            except Exception:
+        if torch.cuda.is_available():
+            for idx in range(int(torch.cuda.device_count() or 0)):
+                props = torch.cuda.get_device_properties(idx)
+                name = str(getattr(props, "name", "")).strip() or f"CUDA GPU {idx}"
+                total_mem = int(getattr(props, "total_memory", 0) or 0)
+                memory = _format_gb(total_mem)
                 cc = None
-            sm = getattr(props, "multi_processor_count", None)
-            devices.append(
-                HardwareDeviceOut(
-                    id=f"gpu-{idx}",
-                    name=name,
-                    type="Discrete GPU",
-                    vendor="NVIDIA",
-                    memory=memory,
-                    cores=int(sm) if isinstance(sm, int) else None,
-                    compute_capability=cc,
-                    status="Available",
+                try:
+                    cc = f"{int(props.major)}.{int(props.minor)}"
+                except Exception:
+                    cc = None
+                sm = getattr(props, "multi_processor_count", None)
+                devices.append(
+                    HardwareDeviceOut(
+                        id=f"gpu-{idx}",
+                        name=name,
+                        type="Discrete GPU",
+                        vendor="NVIDIA",
+                        memory=memory,
+                        cores=int(sm) if isinstance(sm, int) else None,
+                        compute_capability=cc,
+                        status="Available",
+                    )
                 )
-            )
-        return devices
+            return devices
     except Exception:
+        # Fall back to nvidia-smi below.
+        devices = []
+
+    # Fallback: show NVIDIA GPU hardware via nvidia-smi even if torch is CPU-only/missing.
+    rows = _nvidia_smi_snapshot()
+    if not rows:
         return []
+    for idx, row in enumerate(rows):
+        name = str((row or {}).get("name") or "").strip() or f"NVIDIA GPU {idx}"
+        total_mb = _try_int((row or {}).get("memory_total_mb"))
+        memory = _format_gb(int(total_mb) * 1024 * 1024) if total_mb else None
+        devices.append(
+            HardwareDeviceOut(
+                id=f"gpu-{idx}",
+                name=name,
+                type="Discrete GPU",
+                vendor="NVIDIA",
+                memory=memory,
+                cores=None,
+                compute_capability=None,
+                status="Available",
+            )
+        )
+    return devices
 
 
 @app.get("/hardware", response_model=ApiResponse[list[HardwareDeviceOut]])

@@ -10,6 +10,7 @@ AIPT 是一个面向工业视觉场景的本地化平台，覆盖 **项目/数�
 
 - 自动打开 GUI 启动器
 - 自动检查/安装依赖（后端 pip、前端 npm）
+- 若检测到 NVIDIA GPU（`nvidia-smi` 可用），会自动尝试安装 CUDA 版 PyTorch（首次下载体积较大）
 - 自动拉起后端（`8000`）与前端（`5173`）
 - 自动打开浏览器进入平台
 
@@ -71,7 +72,12 @@ winget install --id Microsoft.VCRedist.2015+.x64 -e --source winget
 ### 2) 创建纯净后端虚拟环境（repo-local）
 
 ```powershell
-python -m venv .venv
+# 推荐：明确使用 Python 3.11（若系统有 py 启动器）
+py -3.11 -m venv .venv
+
+# 备选：若没有 py，可用 python（确保 python --version >= 3.11）
+# python -m venv .venv
+
 .\.venv\Scripts\python -m pip install -U pip
 .\.venv\Scripts\python -m pip install -r .\backend\requirements.txt
 ```
