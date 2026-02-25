@@ -1,6 +1,6 @@
 # ruff: noqa: E402
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from PIL import Image
 import hashlib
 import inspect
@@ -19,6 +19,7 @@ import datetime as dt
 import logging
 import mimetypes
 import re
+import json
 import shutil
 import subprocess  # nosec B404 - used for local hardware discovery (WMIC)
 import threading
@@ -38,7 +39,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 logger = logging.getLogger(__name__)
 
 from db import SessionLocal, get_db, init_db
-from db_models import Annotation, Dataset, DatasetFile, Image as ImageModel, LabelClass, Project, TrainedModel
+from db_models import Annotation, Dataset, DatasetFile, Image as ImageModel, LabelClass, Pipeline, Project, TrainedModel
 from model import ObjectDetector
 from storage import (
     delete_storage_path,
@@ -72,6 +73,13 @@ from schemas import (
     ModelEvaluationDetectionOut,
     ModelEvaluationItemOut,
     ModelEvaluationPageOut,
+    PipelineCreate,
+    PipelineOut,
+    PipelineRunOut,
+    PipelineRunRequest,
+    PipelineRunStepOut,
+    PipelineStepSpec,
+    PipelineUpdate,
     ProjectCreate,
     ProjectOut,
     ProjectUpdate,
@@ -81,6 +89,9 @@ from schemas import (
 )
 
 from app_config import load_settings, update_settings
+from inference_runtime import InferenceSessionRegistry, InferenceSessionRuntime
+from pipeline_runtime import run_pipeline_steps as run_pipeline_runtime_steps
+from ultralytics_compat import filter_kwargs_by_signature, import_yolo
 
 # Initialize model
 detector = None
@@ -89,7 +100,7 @@ detector = None
 def _default_model_weights_path() -> Path | None:
     """
     Local-first: prefer weights under the configured resources directory.
-    If missing, seed from the repo root `yolov8n.pt` when available.
+    If missing, seed from the repo root `yolo26n.pt` when available.
     """
     try:
         settings = load_settings()
@@ -98,7 +109,8 @@ def _default_model_weights_path() -> Path | None:
         resources_root = None  # type: ignore[assignment]
 
     repo_root = Path(__file__).resolve().parents[1]
-    repo_weights = (repo_root / "yolov8n.pt").resolve()
+    repo_weights = (repo_root / "yolo26n.pt").resolve()
+    repo_fallback = (repo_root / "yolov8n.pt").resolve()
 
     if resources_root:
         models_dir = resources_root / "models"
@@ -108,7 +120,7 @@ def _default_model_weights_path() -> Path | None:
             models_dir = None  # type: ignore[assignment]
 
         if models_dir:
-            seeded = (models_dir / "yolov8n.pt").resolve()
+            seeded = (models_dir / "yolo26n.pt").resolve()
             if seeded.exists():
                 return seeded
             if repo_weights.exists():
@@ -117,9 +129,19 @@ def _default_model_weights_path() -> Path | None:
                     return seeded
                 except Exception:
                     return repo_weights
+            if repo_fallback.exists():
+                try:
+                    fallback_seeded = (models_dir / "yolov8n.pt").resolve()
+                    if not fallback_seeded.exists():
+                        shutil.copy2(repo_fallback, fallback_seeded)
+                    return fallback_seeded
+                except Exception:
+                    return repo_fallback
 
     if repo_weights.exists():
         return repo_weights
+    if repo_fallback.exists():
+        return repo_fallback
 
     return None
 
@@ -129,13 +151,13 @@ def _resolve_train_model_arg(model: str | None) -> str:
     Resolve a YOLO model identifier to a local weights path when possible.
 
     - If `model` is a local file path and exists, return it.
-    - If `model` is a stem like "yolov8m", prefer `<resources_root>/models/yolov8m.pt`,
+    - If `model` is a stem like "yolo26m", prefer `<resources_root>/models/yolo26m.pt`,
       seeding from the repo root when available.
     - Otherwise, return the original value (letting ultralytics resolve/download).
     """
     raw = (model or "").strip()
     if not raw:
-        raw = "yolov8m.pt"
+        raw = "yolo26m.pt"
 
     try:
         p = Path(raw)
@@ -178,15 +200,23 @@ async def lifespan(app: FastAPI):
     global detector
     init_db()
     try:
-        model_path = _default_model_weights_path()
-        if model_path and model_path.exists():
-            detector = ObjectDetector(str(model_path))
-            logger.info("Model loaded successfully: %s", model_path)
-        else:
+        skip_startup_model = str(os.getenv("AIPT_SKIP_STARTUP_MODEL") or "").strip().lower() in ("1", "true", "yes")
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            skip_startup_model = True
+
+        if skip_startup_model:
             detector = None
-            logger.warning(
-                "Model weights not found. Place a YOLO .pt file under the resources dir (models/) or repo root."
-            )
+            logger.info("Startup model load skipped (AIPT_SKIP_STARTUP_MODEL/PYTEST_CURRENT_TEST).")
+        else:
+            model_path = _default_model_weights_path()
+            if model_path and model_path.exists():
+                detector = ObjectDetector(str(model_path))
+                logger.info("Model loaded successfully: %s", model_path)
+            else:
+                detector = None
+                logger.warning(
+                    "Model weights not found. Place a YOLO .pt file under the resources dir (models/) or repo root."
+                )
     except Exception as e:
         logger.exception("Error loading model: %s", e)
     yield
@@ -257,6 +287,15 @@ class TrainConfig(BaseModel):
     batch: int = 16
     lr0: float | None = None
     model: str | None = None
+    mode: Literal["transfer", "incremental"] = "transfer"
+    output_name: str | None = None
+    base_model_id: str | None = None
+    device: str | None = None
+
+    # Performance hints (optional; best-effort forwarded to Ultralytics when supported).
+    amp: bool | None = None
+    workers: int | None = None
+    cache: bool | Literal["ram"] | None = None
     project_id: str | None = None
     dataset_id: str | None = None
 
@@ -328,28 +367,83 @@ _EVAL_MODELS_MAX = 4
 
 
 InferenceFormat = Literal["tensorrt", "openvino"]
+InferenceKind = Literal["model", "pipeline"]
 
 
 class InferenceSessionCreateIn(BaseModel):
     project_id: str
-    model_id: str
-    format: InferenceFormat = "tensorrt"
+    kind: InferenceKind | None = None
+    target_id: str | None = None
+    # Backward-compat for old clients.
+    model_id: str | None = None
+
+    format: InferenceFormat | None = None
     device: str | None = None
+    end2end: bool | None = None
 
     # Export hints (optional).
-    half: bool = True
-    int8: bool = False
+    half: bool | None = None
+    int8: bool | None = None
     workspace: int | None = None
     batch: int | None = None
     imgsz: int | None = None
+
+    @model_validator(mode="after")
+    def _normalize_and_validate(self) -> "InferenceSessionCreateIn":
+        kind = (self.kind or "").strip().lower()
+        target_id = (self.target_id or "").strip()
+        legacy_model_id = (self.model_id or "").strip()
+
+        if not kind and not target_id and legacy_model_id:
+            kind = "model"
+            target_id = legacy_model_id
+        elif kind == "model" and not target_id and legacy_model_id:
+            target_id = legacy_model_id
+
+        if kind not in {"model", "pipeline"}:
+            raise ValueError("kind must be one of: model, pipeline")
+        if not target_id:
+            raise ValueError("target_id is required")
+
+        self.kind = kind  # type: ignore[assignment]
+        self.target_id = target_id
+
+        if kind == "model":
+            if self.format is None:
+                self.format = "tensorrt"
+            if self.end2end is None:
+                self.end2end = False
+            if self.half is None:
+                self.half = True
+            if self.int8 is None:
+                self.int8 = False
+            return self
+
+        # kind == "pipeline": reject model-only export knobs.
+        invalid = []
+        for name in ("format", "end2end", "half", "int8", "workspace", "batch", "imgsz", "model_id"):
+            if getattr(self, name) is not None:
+                invalid.append(name)
+        if invalid:
+            raise ValueError(f"kind=pipeline does not accept fields: {', '.join(invalid)}")
+
+        self.format = None
+        self.end2end = False
+        self.half = False
+        self.int8 = False
+        return self
 
 
 class InferenceSessionOut(BaseModel):
     id: str
     project_id: str
-    model_id: str
-    format: InferenceFormat
+    kind: InferenceKind
+    target_id: str
+    target_name: str
+    model_id: str | None = None
+    format: InferenceFormat | None = None
     device: str | None = None
+    end2end: bool = False
     created_at: str
     last_used_at: str | None = None
     cached_artifact: str | None = None
@@ -362,32 +456,13 @@ class InferenceStatusOut(BaseModel):
 
 class InferencePredictionOut(BaseModel):
     session_id: str
-    detections: list[ModelEvaluationDetectionOut]
+    detections: list[ModelEvaluationDetectionOut] = []
+    merged_detections: list[ModelEvaluationDetectionOut] = []
+    steps: list[PipelineRunStepOut] | None = None
     note: str | None = None
 
 
-@dataclass
-class _InferenceSession:
-    id: str
-    key: str
-    project_id: str
-    model_id: str
-    format: InferenceFormat
-    device: str | None
-    artifact_path: Path
-    model: object
-    created_at: str
-    last_used_at: str | None = None
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    active_requests: int = 0
-
-
-_INFER_LOCK = threading.Lock()
-_INFER_SESSIONS: dict[str, _InferenceSession] = {}
-_INFER_SESSION_BY_KEY: dict[str, str] = {}
-_INFER_ACTIVE_REQUESTS: int = 0
-_INFER_LOADING: dict[str, threading.Event] = {}
-_INFER_LOADING_ERRORS: dict[str, str] = {}
+_INFER_REGISTRY = InferenceSessionRegistry()
 
 
 class SmartDetectRequest(BaseModel):
@@ -402,16 +477,20 @@ class SmartDetectRequest(BaseModel):
     max_det_per_image: int = 20
     min_distance: int | None = None
     dedup_iou: float = 0.8
+    only_unannotated: bool = False
 
 
 class SmartDetectImageOut(BaseModel):
     image_id: str
     created: int
+    skipped: bool = False
+    reason: str | None = None
 
 
 class SmartDetectResponse(BaseModel):
     processed_images: int
     created_annotations: int
+    skipped_images: int = 0
     template_size: tuple[int, int]
     images: list[SmartDetectImageOut]
 
@@ -445,7 +524,7 @@ def _get_eval_model(weights_path: Path):
     if cached is not None:
         return cached
     try:
-        from ultralytics import YOLO  # type: ignore
+        YOLO = import_yolo()
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(f"ultralytics is not available: {exc}") from exc
     model = YOLO(str(weights_path))
@@ -459,6 +538,87 @@ def _get_eval_model(weights_path: Path):
     return model
 
 
+@dataclass
+class _PipelineCachedModel:
+    key: str
+    model: object
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+_PIPELINE_MODELS_LOCK = threading.Lock()
+_PIPELINE_MODELS: dict[str, _PipelineCachedModel] = {}
+_PIPELINE_MODELS_ORDER: list[str] = []
+_PIPELINE_LOADING: dict[str, threading.Event] = {}
+_PIPELINE_LOADING_ERRORS: dict[str, str] = {}
+_PIPELINE_MODELS_MAX = 6
+
+
+def _get_pipeline_model(weights_path: Path) -> _PipelineCachedModel:
+    key = str(weights_path.resolve())
+
+    with _PIPELINE_MODELS_LOCK:
+        cached = _PIPELINE_MODELS.get(key)
+        if cached is not None:
+            try:
+                _PIPELINE_MODELS_ORDER.remove(key)
+            except ValueError:
+                pass
+            _PIPELINE_MODELS_ORDER.append(key)
+            return cached
+
+        evt = _PIPELINE_LOADING.get(key)
+        if evt is None:
+            evt = threading.Event()
+            _PIPELINE_LOADING[key] = evt
+            is_loader = True
+        else:
+            is_loader = False
+
+    if not is_loader:
+        evt.wait(timeout=1200)
+        with _PIPELINE_MODELS_LOCK:
+            cached = _PIPELINE_MODELS.get(key)
+            if cached is not None:
+                return cached
+            err = _PIPELINE_LOADING_ERRORS.pop(key, None)
+        raise RuntimeError(err or "Pipeline model initialization failed")
+
+    try:
+        try:
+            YOLO = import_yolo()
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(f"ultralytics is not available: {exc}") from exc
+
+        model_obj = YOLO(str(weights_path))
+        cached = _PipelineCachedModel(key=key, model=model_obj)
+
+        with _PIPELINE_MODELS_LOCK:
+            _PIPELINE_MODELS[key] = cached
+            try:
+                _PIPELINE_MODELS_ORDER.remove(key)
+            except ValueError:
+                pass
+            _PIPELINE_MODELS_ORDER.append(key)
+            while len(_PIPELINE_MODELS_ORDER) > _PIPELINE_MODELS_MAX:
+                oldest = _PIPELINE_MODELS_ORDER.pop(0)
+                if oldest == key:
+                    continue
+                _PIPELINE_MODELS.pop(oldest, None)
+        return cached
+    except Exception as exc:
+        with _PIPELINE_MODELS_LOCK:
+            _PIPELINE_LOADING_ERRORS[key] = str(exc)
+        raise
+    finally:
+        with _PIPELINE_MODELS_LOCK:
+            evt = _PIPELINE_LOADING.pop(key, None)
+            if evt is not None:
+                try:
+                    evt.set()
+                except Exception:
+                    pass
+
+
 def _active_training_job() -> TrainJobStatusOut | None:
     with _TRAIN_JOBS_LOCK:
         jobs = [j for j in _TRAIN_JOBS.values() if j.status in ("queued", "running", "stopping")]
@@ -468,39 +628,91 @@ def _active_training_job() -> TrainJobStatusOut | None:
 
 
 def _training_blocked_by_inference_reason() -> str | None:
-    with _INFER_LOCK:
-        if _INFER_LOADING:
-            return "Inference session is initializing"
-        if _INFER_ACTIVE_REQUESTS > 0:
-            return f"Inference is running (active_requests={_INFER_ACTIVE_REQUESTS})"
-        if _INFER_SESSIONS:
-            any_id = next(iter(_INFER_SESSIONS.keys()))
-            return f"Inference session is active (session_id={any_id})"
-    return None
+    return _INFER_REGISTRY.block_reason()
 
 
 def _inference_status_snapshot() -> InferenceStatusOut:
-    with _INFER_LOCK:
-        active_requests = int(_INFER_ACTIVE_REQUESTS)
-        sessions = [
-            InferenceSessionOut(
-                id=s.id,
-                project_id=s.project_id,
-                model_id=s.model_id,
-                format=s.format,
-                device=s.device,
-                created_at=s.created_at,
-                last_used_at=s.last_used_at,
-                cached_artifact=s.artifact_path.name if s.artifact_path else None,
-            )
-            for s in _INFER_SESSIONS.values()
-        ]
-    sessions.sort(key=lambda s: s.created_at, reverse=True)
+    active_requests, session_items = _INFER_REGISTRY.snapshot()
+    sessions = [
+        InferenceSessionOut(
+            id=s.id,
+            project_id=s.project_id,
+            kind=s.kind,
+            target_id=s.target_id,
+            target_name=s.target_name,
+            model_id=s.target_id if s.kind == "model" else None,
+            format=s.format,
+            device=s.device,
+            end2end=bool(getattr(s, "end2end", False)),
+            created_at=s.created_at,
+            last_used_at=s.last_used_at,
+            cached_artifact=s.artifact_path.name if s.artifact_path else None,
+        )
+        for s in session_items
+    ]
     return InferenceStatusOut(active_requests=active_requests, sessions=sessions)
 
 
-def _inference_cache_dir(project_root: Path, project_id: str, model_id: str, fmt: InferenceFormat) -> Path:
-    base = (project_root / "projects" / project_id / "deploy_cache" / model_id / fmt).resolve()
+def _resources_root_dir() -> Path:
+    try:
+        settings = load_settings()
+        root = Path(str(settings.get("resources_root_dir") or "")).expanduser().resolve()
+        if not str(root):
+            raise ValueError("empty resources_root_dir")
+        return root
+    except Exception:
+        return (Path.home() / ".aipt" / "resources").resolve()
+
+
+def _remove_tree(path: Path, *, what: str) -> None:
+    if not path.exists():
+        return
+    try:
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+    except Exception as exc:
+        logger.debug("Failed to delete %s directory (path=%s)", what, path, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to delete {what} directory") from exc
+
+
+def _close_inference_sessions(
+    *,
+    project_id: str | None = None,
+    kind: InferenceKind | None = None,
+    target_id: str | None = None,
+) -> None:
+    _, sessions = _INFER_REGISTRY.snapshot()
+    matched: list[InferenceSessionRuntime] = []
+    for sess in sessions:
+        if project_id and sess.project_id != project_id:
+            continue
+        if kind and sess.kind != kind:
+            continue
+        if target_id and sess.target_id != target_id:
+            continue
+        matched.append(sess)
+
+    busy = next((s for s in matched if int(getattr(s, "active_requests", 0) or 0) > 0), None)
+    if busy is not None:
+        raise HTTPException(status_code=409, detail=f"Inference session is busy (session_id={busy.id})")
+
+    for sess in matched:
+        try:
+            _INFER_REGISTRY.close(sess.id)
+        except KeyError:
+            continue
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _inference_cache_dir(project_root: Path, project_id: str, model_id: str, fmt: InferenceFormat, end2end: bool) -> Path:
+    # Prefer the global resources directory for deployment caches to avoid
+    # Windows MAX_PATH issues under deep project storage roots.
+    base_root = _resources_root_dir()
+
+    base = (base_root / "deploy_cache" / project_id / model_id / fmt / f"end2end_{1 if end2end else 0}").resolve()
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -526,48 +738,43 @@ def _export_inference_artifact(
     workspace: int | None,
     batch: int | None,
     imgsz: int | None,
+    end2end: bool,
 ) -> Path:
     try:
-        from ultralytics import YOLO  # type: ignore
+        YOLO = import_yolo()
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=503, detail=f"ultralytics is not available: {exc}") from exc
 
     ul_fmt = "engine" if fmt == "tensorrt" else "openvino"
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix=f"infer_{fmt}_", dir=str(cache_dir))).resolve()
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"infer_{fmt}_")).resolve()
     try:
         yolo = YOLO(str(weights_path))
 
-        export_kwargs: dict[str, object] = {"format": ul_fmt}
-        try:
-            sig = inspect.signature(yolo.export)
-            params = sig.parameters
-        except Exception:
-            params = {}
-
-        # Export into tmp_dir for deterministic caching.
-        if "project" in params:
-            export_kwargs["project"] = str(tmp_dir)
-        if "name" in params:
-            export_kwargs["name"] = "export"
-        if "exist_ok" in params:
-            export_kwargs["exist_ok"] = True
-        if "save_dir" in params:
-            export_kwargs["save_dir"] = str(tmp_dir)
-        if device and "device" in params:
-            export_kwargs["device"] = device
-        if "half" in params:
-            export_kwargs["half"] = bool(half)
-        if "int8" in params:
-            export_kwargs["int8"] = bool(int8)
-        if workspace is not None and "workspace" in params:
+        export_kwargs: dict[str, object] = {
+            "format": ul_fmt,
+            "project": str(tmp_dir),
+            "name": "export",
+            "exist_ok": True,
+            "save_dir": str(tmp_dir),
+            "half": bool(half),
+            "int8": bool(int8),
+            "end2end": bool(end2end),
+        }
+        if device and device.strip():
+            export_kwargs["device"] = device.strip()
+        if workspace is not None:
             export_kwargs["workspace"] = int(workspace)
-        if batch is not None and "batch" in params:
+        if batch is not None:
             export_kwargs["batch"] = int(batch)
-        if imgsz is not None and "imgsz" in params:
+        if imgsz is not None:
             export_kwargs["imgsz"] = int(imgsz)
 
-        result = yolo.export(**export_kwargs)
+        safe_export_kwargs = filter_kwargs_by_signature(yolo.export, export_kwargs)
+        try:
+            result = yolo.export(**safe_export_kwargs)
+        except TypeError:
+            result = yolo.export(format=ul_fmt)
 
         exported: Path | None = None
         if isinstance(result, (str, Path)):
@@ -623,20 +830,22 @@ def _export_inference_artifact(
 
 
 def _ensure_inference_artifact(weights_path: Path, cache_dir: Path, req: InferenceSessionCreateIn) -> Path:
-    if req.format == "tensorrt":
+    fmt = req.format or "tensorrt"
+    if fmt == "tensorrt":
         target = (cache_dir / f"{weights_path.stem}.engine").resolve()
         if target.exists():
             return target
         return _export_inference_artifact(
             weights_path=weights_path,
             cache_dir=cache_dir,
-            fmt=req.format,
+            fmt=fmt,
             device=req.device,
-            half=req.half,
-            int8=req.int8,
+            half=bool(req.half),
+            int8=bool(req.int8),
             workspace=req.workspace,
             batch=req.batch,
             imgsz=req.imgsz,
+            end2end=bool(req.end2end),
         )
 
     # openvino
@@ -646,13 +855,14 @@ def _ensure_inference_artifact(weights_path: Path, cache_dir: Path, req: Inferen
     return _export_inference_artifact(
         weights_path=weights_path,
         cache_dir=cache_dir,
-        fmt=req.format,
+        fmt=fmt,
         device=req.device,
-        half=req.half,
-        int8=req.int8,
+        half=bool(req.half),
+        int8=bool(req.int8),
         workspace=req.workspace,
         batch=req.batch,
         imgsz=req.imgsz,
+        end2end=bool(req.end2end),
     )
 
 
@@ -740,14 +950,7 @@ def _collect_train_diagnostics() -> TrainDiagnosticsOut:
 
 
 def _training_root_dir() -> Path:
-    try:
-        settings = load_settings()
-        root = Path(str(settings.get("resources_root_dir") or "")).expanduser().resolve()
-        if not str(root):
-            raise ValueError("empty resources_root_dir")
-        path = (root / "training").resolve()
-    except Exception:
-        path = (Path.home() / ".aipt" / "resources" / "training").resolve()
+    path = (_resources_root_dir() / "training").resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -771,12 +974,13 @@ def _annotation_to_yolo_lines(ann: Annotation, class_index: dict[str, int], img_
         y = float(ann.y or 0)
         w = float(ann.width or 0)
         h = float(ann.height or 0)
-        if w <= 0 or h <= 0:
+        if w == 0 or h == 0:
             return []
-        x1 = x
-        y1 = y
-        x2 = x + w
-        y2 = y + h
+        # Normalize reverse-drawn rectangles (negative width/height) instead of dropping them.
+        x1 = min(x, x + w)
+        y1 = min(y, y + h)
+        x2 = max(x, x + w)
+        y2 = max(y, y + h)
     elif ann.type == "polygon" and ann.points:
         pts = list(ann.points or [])
         if len(pts) < 6 or len(pts) % 2 != 0:
@@ -805,6 +1009,29 @@ def _annotation_to_yolo_lines(ann: Annotation, class_index: dict[str, int], img_
     bh_n = bh / float(img_h)
     cls = int(class_index[label])
     return [f"{cls} {xc:.6f} {yc:.6f} {bw_n:.6f} {bh_n:.6f}"]
+
+
+def _normalize_rect_payload(ann_data: dict) -> None:
+    if str(ann_data.get("type") or "").strip() != "rect":
+        return
+    for key in ("x", "y", "width", "height"):
+        if ann_data.get(key) is None:
+            return
+    try:
+        x = float(ann_data.get("x") or 0.0)
+        y = float(ann_data.get("y") or 0.0)
+        w = float(ann_data.get("width") or 0.0)
+        h = float(ann_data.get("height") or 0.0)
+    except Exception:
+        return
+    x1 = min(x, x + w)
+    y1 = min(y, y + h)
+    x2 = max(x, x + w)
+    y2 = max(y, y + h)
+    ann_data["x"] = x1
+    ann_data["y"] = y1
+    ann_data["width"] = x2 - x1
+    ann_data["height"] = y2 - y1
 
 
 def _prepare_yolo_dataset(dataset_id: str, job_dir: Path) -> Path:
@@ -974,7 +1201,7 @@ def _persist_trained_model(job_id: str, cfg: TrainConfig, job_dir: Path) -> None
     if not project_id:
         return
 
-    dataset_id = (cfg.dataset_id or "").strip() or None
+    dataset_id = _resolve_dataset_id(cfg)
     run_dir = (job_dir / "runs" / "train").resolve()
     weights_src = run_dir / "weights" / "best.pt"
     if not weights_src.exists():
@@ -983,7 +1210,6 @@ def _persist_trained_model(job_id: str, cfg: TrainConfig, job_dir: Path) -> None
     results_src = run_dir / "results.csv"
 
     model_id = str(uuid.uuid4())
-    model_name_hint = Path(cfg.model or "yolov8m").stem or "model"
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     db = SessionLocal()
@@ -993,6 +1219,32 @@ def _persist_trained_model(job_id: str, cfg: TrainConfig, job_dir: Path) -> None
             return
         project_root = project_storage_root(project.storage_root)
         ensure_project_dirs(project_id, root=project_root)
+
+        parent: TrainedModel | None = None
+        if cfg.mode == "incremental" and (cfg.base_model_id or "").strip():
+            candidate = db.get(TrainedModel, cfg.base_model_id.strip())
+            if candidate and candidate.project_id == project_id:
+                parent = candidate
+
+        model_name_hint = Path(cfg.model or (parent.base_model if parent else "yolo26m")).stem or "model"
+
+        desired_name = (cfg.output_name or "").strip()
+        if desired_name:
+            model_name = desired_name
+        elif cfg.mode == "incremental":
+            base = parent.name if parent else model_name_hint
+            model_name = f"{base}-inc-{ts}"
+        else:
+            model_name = f"{model_name_hint}-{ts}"
+
+        if (
+            db.query(TrainedModel)
+            .filter(TrainedModel.project_id == project_id)
+            .filter(TrainedModel.name == model_name)
+            .first()
+            is not None
+        ):
+            model_name = f"{model_name}-{ts}"
 
         model_dir = (project_root / "projects" / project_id / "models" / model_id).resolve()
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -1014,12 +1266,17 @@ def _persist_trained_model(job_id: str, cfg: TrainConfig, job_dir: Path) -> None
             except Exception:
                 logger.debug("Failed to summarize metrics for trained model (job_id=%s)", job_id, exc_info=True)
 
+        base_model = parent.base_model if parent else (model_name_hint or (cfg.model or "yolo26m"))
+
         rec = TrainedModel(
             id=model_id,
             project_id=project_id,
             dataset_id=dataset_id,
-            name=f"{model_name_hint}-{ts}",
-            base_model=cfg.model or model_name_hint,
+            parent_model_id=parent.id if parent else None,
+            name=model_name,
+            base_model=str(base_model),
+            train_mode=cfg.mode,
+            train_config=cfg.model_dump(exclude_none=True),
             weights_path=weights_rel,
             results_path=results_rel,
             metrics=metrics_summary,
@@ -1085,32 +1342,94 @@ def _run_training_job(job_id: str, resume: bool = False) -> None:
             if force_mock:
                 raise RuntimeError("forced mock training")
 
-            from ultralytics import YOLO  # type: ignore
-
             out_dir = (Path(job.log_path).parent / "runs").resolve()
             out_dir.mkdir(parents=True, exist_ok=True)
             write_log(f"[train] output_dir={out_dir}")
-            model_arg = _resolve_train_model_arg(cfg.model)
+
+            write_log(
+                f"[train] mode={cfg.mode} base_model_id={(cfg.base_model_id or '').strip()} output_name={(cfg.output_name or '').strip()}"
+            )
+
+            model_arg: str
+            if cfg.mode == "incremental":
+                base_id = (cfg.base_model_id or "").strip()
+                if not base_id:
+                    raise RuntimeError("incremental training requires base_model_id")
+
+                db = SessionLocal()
+                try:
+                    parent = db.get(TrainedModel, base_id)
+                    if not parent:
+                        raise RuntimeError(f"base model not found: {base_id}")
+
+                    expected_project_id = (cfg.project_id or "").strip()
+                    if expected_project_id and parent.project_id != expected_project_id:
+                        raise RuntimeError("base_model_id does not belong to the selected project")
+
+                    parent_project = db.get(Project, parent.project_id)
+                    if not parent_project:
+                        raise RuntimeError("Project not found for base model")
+
+                    project_root = project_storage_root(parent_project.storage_root)
+                    base_weights = resolve_storage_path(parent.weights_path, root=project_root)
+                    if not base_weights.exists():
+                        raise RuntimeError("Base model weights not found on disk")
+                    model_arg = str(base_weights.resolve())
+                    write_log(f"[train] incremental_base_weights={model_arg}")
+                finally:
+                    db.close()
+            else:
+                model_arg = _resolve_train_model_arg(cfg.model)
             if resume:
                 last_weights = out_dir / "train" / "weights" / "last.pt"
                 if last_weights.exists():
                     model_arg = str(last_weights)
                 else:
-                    write_log("[train] resume requested but last.pt is missing; starting from model config")
+                    write_log("[train] resume requested but last.pt is missing; starting from initial weights")
 
             write_log(f"[train] model_arg={model_arg}")
+            YOLO = import_yolo()
             yolo = YOLO(model_arg)
+
+            resolved_device = (cfg.device or "").strip() or None
+            if not resolved_device:
+                try:
+                    import torch  # type: ignore
+
+                    resolved_device = "0" if torch.cuda.is_available() else "cpu"
+                except Exception:
+                    resolved_device = "cpu"
+            write_log(f"[train] device={resolved_device}")
+
+            epochs_total = int(cfg.epochs or 1)
+
+            def _request_stop(trainer) -> None:  # type: ignore[no-untyped-def]
+                try:
+                    trainer.stop = True
+                except Exception:
+                    setattr(trainer, "stop", True)
 
             def _stop_cb(trainer, *args, **kwargs):  # type: ignore[no-untyped-def]
                 if stop_evt.is_set():
-                    try:
-                        trainer.stop = True
-                    except Exception:
-                        setattr(trainer, "stop", True)
+                    _request_stop(trainer)
+
+            def _epoch_end_cb(trainer, *args, **kwargs):  # type: ignore[no-untyped-def]
+                if stop_evt.is_set():
+                    _request_stop(trainer)
+                try:
+                    epoch = int(getattr(trainer, "epoch", 0) or 0)
+                except Exception:
+                    return
+                progress = (epoch + 1) / float(max(1, epochs_total))
+                message = f"Epoch {epoch + 1}/{epochs_total}"
+                _set_train_job(
+                    job_id,
+                    lambda j, p=progress, m=message: j.model_copy(update={"progress": p, "message": m}),
+                )
 
             if hasattr(yolo, "add_callback"):
                 try:
-                    yolo.add_callback("on_train_epoch_end", _stop_cb)
+                    yolo.add_callback("on_train_epoch_end", _epoch_end_cb)
                 except Exception:
                     logger.debug("Failed to register ultralytics callback on_train_epoch_end", exc_info=True)
                 try:
@@ -1119,18 +1438,31 @@ def _run_training_job(job_id: str, resume: bool = False) -> None:
                     logger.debug("Failed to register ultralytics callback on_train_batch_end", exc_info=True)
 
             with log_path.open("a", encoding="utf-8") as f, redirect_stdout(f), redirect_stderr(f):
-                yolo.train(
-                    data=data_yaml,
-                    epochs=int(cfg.epochs),
-                    imgsz=int(cfg.imgsz),
-                    batch=int(cfg.batch),
-                    lr0=cfg.lr0,
-                    project=str(out_dir),
-                    name="train",
-                    exist_ok=True,
-                    verbose=True,
-                    resume=resume,
-                )
+                train_kwargs: dict[str, object] = {
+                    "data": data_yaml,
+                    "epochs": int(cfg.epochs),
+                    "imgsz": int(cfg.imgsz),
+                    "batch": int(cfg.batch),
+                    "project": str(out_dir),
+                    "name": "train",
+                    "exist_ok": True,
+                    "verbose": True,
+                    "resume": bool(resume),
+                }
+                if cfg.lr0 is not None:
+                    train_kwargs["lr0"] = float(cfg.lr0)
+                if resolved_device:
+                    train_kwargs["device"] = resolved_device
+                if cfg.amp is not None:
+                    train_kwargs["amp"] = bool(cfg.amp)
+                elif resolved_device != "cpu":
+                    train_kwargs["amp"] = True
+                if cfg.workers is not None:
+                    train_kwargs["workers"] = int(cfg.workers)
+                if cfg.cache is not None:
+                    train_kwargs["cache"] = cfg.cache
+
+                yolo.train(**filter_kwargs_by_signature(yolo.train, train_kwargs))
         except Exception as exc:
             write_log(f"[train] ultralytics training unavailable, falling back to mock run: {exc}")
             # Mock progress: prints loss-like lines so UI can validate "loss updates".
@@ -2161,6 +2493,12 @@ def delete_dataset(dataset_id: str, user: str = Depends(get_current_user), db: S
         except Exception:
             logger.debug("Failed to delete storage path (rel=%s)", f.storage_path, exc_info=True)
 
+    dataset_dir_path: Path | None = None
+    if root is not None and dataset.project_id:
+        dataset_dir_path = (root / "projects" / dataset.project_id / "datasets" / dataset_id).resolve()
+    if dataset_dir_path is not None:
+        _remove_tree(dataset_dir_path, what="dataset")
+
     # Remove any images that were generated from this dataset.
     db.query(ImageModel).filter(ImageModel.dataset_id == dataset_id).delete(synchronize_session=False)
     db.delete(dataset)
@@ -2530,6 +2868,22 @@ def delete_project(project_id: str, db: Session = Depends(get_db)):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    _close_inference_sessions(project_id=project_id)
+
+    project_root = project_storage_root(project.storage_root)
+    project_dir_path = (project_root / "projects" / project_id).resolve()
+    deploy_cache_dir = (_resources_root_dir() / "deploy_cache" / project_id).resolve()
+
+    # Dataset.project_id is ON DELETE SET NULL, so explicitly deleting linked datasets
+    # avoids orphan records and keeps "delete project" semantics intuitive.
+    datasets = db.query(Dataset).filter(Dataset.project_id == project_id).all()
+    for ds in datasets:
+        db.delete(ds)
+
+    _remove_tree(project_dir_path, what="project")
+    _remove_tree(deploy_cache_dir, what="project deploy cache")
+
     db.delete(project)
     db.commit()
     return None
@@ -2799,6 +3153,7 @@ def replace_image_annotations(
     db.query(Annotation).filter(Annotation.image_id == image_id).delete(synchronize_session=False)
     for ann_in in payload:
         ann_data = ann_in.model_dump(exclude_unset=True)
+        _normalize_rect_payload(ann_data)
         ann = Annotation(image_id=image_id, **ann_data)
         db.add(ann)
 
@@ -2817,7 +3172,28 @@ def update_annotation(annotation_id: str, payload: AnnotationUpdate, db: Session
     ann = db.get(Annotation, annotation_id)
     if not ann:
         raise HTTPException(status_code=404, detail="Annotation not found")
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    patch_data = payload.model_dump(exclude_unset=True)
+    if str(getattr(ann, "type", "")).strip() == "rect" and any(
+        key in patch_data for key in ("x", "y", "width", "height")
+    ):
+        merged = {
+            "type": "rect",
+            "x": patch_data.get("x", ann.x),
+            "y": patch_data.get("y", ann.y),
+            "width": patch_data.get("width", ann.width),
+            "height": patch_data.get("height", ann.height),
+        }
+        _normalize_rect_payload(merged)
+        patch_data.update(
+            {
+                "x": merged.get("x"),
+                "y": merged.get("y"),
+                "width": merged.get("width"),
+                "height": merged.get("height"),
+            }
+        )
+
+    for key, value in patch_data.items():
         setattr(ann, key, value)
     db.add(ann)
     db.commit()
@@ -2863,6 +3239,74 @@ def _load_gray_float(path: Path):
     if arr.size == 0:
         raise ValueError("empty image")
     return arr / 255.0
+
+
+def _match_template_numpy(arr, template):
+    import numpy as np  # local import
+
+    arr = np.asarray(arr, dtype=np.float32)
+    template = np.asarray(template, dtype=np.float32)
+    ih, iw = arr.shape[:2]
+    th, tw = template.shape[:2]
+    if ih < th or iw < tw:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    out_h = ih - th + 1
+    out_w = iw - tw + 1
+    out = np.zeros((out_h, out_w), dtype=np.float32)
+
+    tmpl = template - float(template.mean())
+    denom_t = float(np.sqrt(np.sum(tmpl * tmpl)))
+    if denom_t <= 1e-12:
+        return out
+
+    for y in range(out_h):
+        for x in range(out_w):
+            patch = arr[y : y + th, x : x + tw]
+            p0 = patch - float(patch.mean())
+            denom = float(np.sqrt(np.sum(p0 * p0)) * denom_t)
+            if denom <= 1e-12:
+                score = 0.0
+            else:
+                score = float(np.sum(p0 * tmpl) / denom)
+            out[y, x] = score
+    return out
+
+
+def _peak_local_max_numpy(corr, *, threshold_abs: float, min_distance: int, num_peaks: int):
+    import numpy as np  # local import
+
+    arr = np.asarray(corr, dtype=np.float32)
+    if arr.size == 0:
+        return np.empty((0, 2), dtype=np.int32)
+
+    ys, xs = np.where(arr >= float(threshold_abs))
+    if ys.size == 0:
+        return np.empty((0, 2), dtype=np.int32)
+
+    min_dist = max(1, int(min_distance))
+    max_peaks = max(1, int(num_peaks))
+    scored = sorted(((float(arr[y, x]), int(y), int(x)) for y, x in zip(ys, xs)), key=lambda t: t[0], reverse=True)
+
+    chosen: list[tuple[int, int]] = []
+    min_dist_sq = float(min_dist * min_dist)
+    for _score, y, x in scored:
+        keep = True
+        for cy, cx in chosen:
+            dy = float(y - cy)
+            dx = float(x - cx)
+            if dx * dx + dy * dy < min_dist_sq:
+                keep = False
+                break
+        if not keep:
+            continue
+        chosen.append((y, x))
+        if len(chosen) >= max_peaks:
+            break
+
+    if not chosen:
+        return np.empty((0, 2), dtype=np.int32)
+    return np.asarray(chosen, dtype=np.int32)
 
 
 @app.post("/smart-annotation/detect", response_model=ApiResponse[SmartDetectResponse])
@@ -2976,14 +3420,36 @@ def smart_detect_similar(req: SmartDetectRequest, user: str = Depends(get_curren
             images = images[: max_images]
 
     created_total = 0
+    skipped_total = 0
     image_stats: list[SmartDetectImageOut] = []
 
+    ann_count_by_image: dict[str, int] = {}
+    if bool(req.only_unannotated) and images:
+        image_ids = [str(img.id) for img in images]
+        rows = (
+            db.query(Annotation.image_id, func.count(Annotation.id))
+            .filter(Annotation.image_id.in_(image_ids))
+            .group_by(Annotation.image_id)
+            .all()
+        )
+        ann_count_by_image = {str(image_id): int(cnt or 0) for image_id, cnt in rows}
+
+    match_template = None
+    peak_local_max = None
     try:
-        from skimage.feature import match_template, peak_local_max  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise HTTPException(status_code=503, detail=f"skimage is not available: {exc}") from exc
+        from skimage.feature import match_template as sk_match_template, peak_local_max as sk_peak_local_max  # type: ignore
+
+        match_template = sk_match_template
+        peak_local_max = sk_peak_local_max
+    except Exception as exc:
+        logger.warning("skimage unavailable for smart detect, using numpy fallback: %s", exc)
 
     for img in images:
+        if bool(req.only_unannotated) and int(ann_count_by_image.get(str(img.id), 0)) > 0:
+            skipped_total += 1
+            image_stats.append(SmartDetectImageOut(image_id=img.id, created=0, skipped=True, reason="has_annotations"))
+            continue
+
         created = 0
         try:
             arr = _load_gray_float(image_path(img))
@@ -2998,17 +3464,28 @@ def smart_detect_similar(req: SmartDetectRequest, user: str = Depends(get_curren
             image_stats.append(SmartDetectImageOut(image_id=img.id, created=0))
             continue
 
-        corr = match_template(arr, template, pad_input=False)
+        if match_template is not None:
+            corr = match_template(arr, template, pad_input=False)
+        else:
+            corr = _match_template_numpy(arr, template)
         if corr.size == 0:
             image_stats.append(SmartDetectImageOut(image_id=img.id, created=0))
             continue
 
-        coords = peak_local_max(
-            corr,
-            threshold_abs=threshold,
-            min_distance=min_distance,
-            num_peaks=max_det_per_image,
-        )
+        if peak_local_max is not None:
+            coords = peak_local_max(
+                corr,
+                threshold_abs=threshold,
+                min_distance=min_distance,
+                num_peaks=max_det_per_image,
+            )
+        else:
+            coords = _peak_local_max_numpy(
+                corr,
+                threshold_abs=threshold,
+                min_distance=min_distance,
+                num_peaks=max_det_per_image,
+            )
         if coords is None or len(coords) == 0:
             image_stats.append(SmartDetectImageOut(image_id=img.id, created=0))
             continue
@@ -3067,6 +3544,7 @@ def smart_detect_similar(req: SmartDetectRequest, user: str = Depends(get_curren
         data=SmartDetectResponse(
             processed_images=len(images),
             created_annotations=created_total,
+            skipped_images=skipped_total,
             template_size=(int(tw), int(th)),
             images=image_stats,
         ),
@@ -3133,15 +3611,57 @@ def smart_segment_at_point(req: SmartSegmentRequest, user: str = Depends(get_cur
         logger.debug("Smart segment failed (image_id=%s): %s", req.image_id, exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Smart segment failed: {exc}") from exc
 
+def _parse_predict_classes(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    out: list[int] = []
+    for part in str(raw).split(","):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            out.append(int(token))
+        except Exception:
+            continue
+    return out or None
+
+
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file: UploadFile = File(...),
+    conf: float = Query(default=0.25, ge=0.0, le=1.0),
+    iou: float = Query(default=0.7, ge=0.0, le=1.0),
+    max_det: int = Query(default=100, ge=1, le=1000),
+    imgsz: int | None = Query(default=None, ge=32, le=8192),
+    classes: str | None = Query(default=None, max_length=300),
+):
     if not detector:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
-        results = detector.predict(image)
+        predict_kwargs: dict[str, object] = {
+            "conf": float(conf),
+            "iou": float(iou),
+            "max_det": int(max_det),
+        }
+        if imgsz is not None:
+            predict_kwargs["imgsz"] = int(imgsz)
+        parsed_classes = _parse_predict_classes(classes)
+        if parsed_classes:
+            predict_kwargs["classes"] = parsed_classes
+
+        try:
+            sig = inspect.signature(detector.predict)
+            accepted = {k: v for k, v in predict_kwargs.items() if k in sig.parameters}
+        except Exception:
+            accepted = predict_kwargs
+
+        try:
+            results = detector.predict(image, **accepted)
+        except TypeError:
+            results = detector.predict(image)
         return {"filename": file.filename, "detections": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -3264,6 +3784,12 @@ def train_model(config: TrainConfig):
     if infer_lock:
         raise HTTPException(status_code=409, detail=infer_lock)
 
+    if config.mode == "incremental":
+        if not (config.base_model_id or "").strip():
+            raise HTTPException(status_code=400, detail="base_model_id is required for incremental training")
+        if not (config.project_id or "").strip():
+            raise HTTPException(status_code=400, detail="project_id is required for incremental training")
+
     with _TRAIN_JOBS_LOCK:
         active_jobs = [j for j in _TRAIN_JOBS.values() if j.status in ("queued", "running", "stopping")]
     if active_jobs:
@@ -3308,6 +3834,122 @@ def list_trained_models(project_id: str, db: Session = Depends(get_db)):
     return ApiResponse(code=200, message="OK", data=[TrainedModelOut.model_validate(m) for m in rows])
 
 
+@app.get("/projects/{project_id}/pipelines", response_model=ApiResponse[list[PipelineOut]])
+def list_pipelines(project_id: str, db: Session = Depends(get_db)):
+    rows = (
+        db.query(Pipeline)
+        .filter(Pipeline.project_id == project_id)
+        .order_by(Pipeline.updated_at.desc(), Pipeline.created_at.desc())
+        .all()
+    )
+    return ApiResponse(code=200, message="OK", data=[PipelineOut.model_validate(p) for p in rows])
+
+
+@app.post("/pipelines", response_model=ApiResponse[PipelineOut], status_code=201)
+def create_pipeline(payload: PipelineCreate, db: Session = Depends(get_db)):
+    project = db.get(Project, payload.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    rec = Pipeline(
+        project_id=payload.project_id,
+        name=payload.name,
+        description=payload.description or "",
+        steps=[s.model_dump() for s in (payload.steps or [])],
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return ApiResponse(code=201, message="Created", data=PipelineOut.model_validate(rec))
+
+
+@app.put("/pipelines/{pipeline_id}", response_model=ApiResponse[PipelineOut])
+def update_pipeline(pipeline_id: str, payload: PipelineUpdate, db: Session = Depends(get_db)):
+    rec = db.get(Pipeline, pipeline_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    if payload.name is not None:
+        rec.name = payload.name
+    if payload.description is not None:
+        rec.description = payload.description
+    if payload.steps is not None:
+        rec.steps = [s.model_dump() for s in (payload.steps or [])]
+
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return ApiResponse(code=200, message="OK", data=PipelineOut.model_validate(rec))
+
+
+@app.delete("/pipelines/{pipeline_id}", response_model=ApiResponse[None])
+def delete_pipeline(pipeline_id: str, db: Session = Depends(get_db)):
+    rec = db.get(Pipeline, pipeline_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    _close_inference_sessions(kind="pipeline", target_id=pipeline_id)
+
+    db.delete(rec)
+    db.commit()
+    return ApiResponse(code=200, message="Deleted", data=None)
+
+
+def _run_pipeline_steps(
+    *,
+    project_id: str,
+    steps: list[PipelineStepSpec],
+    image: Image.Image,
+    db: Session,
+) -> PipelineRunOut:
+    return run_pipeline_runtime_steps(
+        project_id=project_id,
+        steps=steps,
+        image=image,
+        db=db,
+        get_pipeline_model=_get_pipeline_model,
+        active_training_job=_active_training_job,
+    )
+
+
+@app.post("/pipelines/run", response_model=ApiResponse[PipelineRunOut])
+async def run_pipeline(payload: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
+    try:
+        req = PipelineRunRequest.model_validate_json(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid payload: {exc}") from exc
+
+    try:
+        raw = await file.read()
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image file: {exc}") from exc
+
+    out = _run_pipeline_steps(project_id=req.project_id, steps=req.steps, image=image, db=db)
+    return ApiResponse(code=200, message="OK", data=out)
+
+
+@app.post("/pipelines/{pipeline_id}/run", response_model=ApiResponse[PipelineRunOut])
+async def run_saved_pipeline(pipeline_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    rec = db.get(Pipeline, pipeline_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    steps_raw = rec.steps or []
+    steps = [PipelineStepSpec.model_validate(s) for s in steps_raw]
+    req = PipelineRunRequest(project_id=rec.project_id, steps=steps)
+
+    try:
+        raw = await file.read()
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image file: {exc}") from exc
+
+    out = _run_pipeline_steps(project_id=req.project_id, steps=req.steps, image=image, db=db)
+    out_with_id = out.model_copy(update={"pipeline_id": rec.id})
+    return ApiResponse(code=200, message="OK", data=out_with_id)
+
+
 @app.get("/models/{model_id}/evaluation", response_model=ApiResponse[ModelEvaluationPageOut])
 def evaluate_trained_model(
     model_id: str,
@@ -3321,6 +3963,7 @@ def evaluate_trained_model(
     device: str | None = Query(default=None, max_length=50),
     half: bool = Query(default=False),
     augment: bool = Query(default=False),
+    end2end: bool = Query(default=False),
     classes: str | None = Query(default=None, max_length=200),
     db: Session = Depends(get_db),
 ):
@@ -3352,8 +3995,8 @@ def evaluate_trained_model(
         .all()
     )
 
-    split_train = float(dataset.split_train or 0.7)
-    split_val = float(dataset.split_val or 0.2)
+    split_train = float(dataset.split_train) if dataset.split_train is not None else 0.7
+    split_val = float(dataset.split_val) if dataset.split_val is not None else 0.2
 
     def pick_split(image_id: str) -> str:
         # Deterministic shuffling for dataset splits (not security-related).
@@ -3414,6 +4057,7 @@ def evaluate_trained_model(
                 predict_kwargs["half"] = True
             if augment:
                 predict_kwargs["augment"] = True
+            predict_kwargs["end2end"] = bool(end2end)
             if classes:
                 selected: list[int] = []
                 for part in str(classes).split(","):
@@ -3428,17 +4072,16 @@ def evaluate_trained_model(
                     predict_kwargs["classes"] = selected
 
             try:
+                call_fn = yolo.predict if hasattr(yolo, "predict") else yolo
                 if hasattr(yolo, "predict"):
-                    results = yolo.predict(str(src_path), **predict_kwargs)
+                    results = call_fn(str(src_path), **filter_kwargs_by_signature(call_fn, predict_kwargs))
                 else:
-                    results = yolo(str(src_path), **predict_kwargs)
+                    results = call_fn(str(src_path), **filter_kwargs_by_signature(call_fn, predict_kwargs))
             except TypeError:
                 # Best-effort backward compat for older ultralytics versions.
                 safe_kwargs = {"verbose": False, "conf": conf}
-                if hasattr(yolo, "predict"):
-                    results = yolo.predict(str(src_path), **safe_kwargs)
-                else:
-                    results = yolo(str(src_path), **safe_kwargs)
+                call_fn = yolo.predict if hasattr(yolo, "predict") else yolo
+                results = call_fn(str(src_path), **filter_kwargs_by_signature(call_fn, safe_kwargs))
             for result in results:
                 boxes = getattr(result, "boxes", None)
                 if not boxes:
@@ -3500,14 +4143,15 @@ def delete_trained_model(model_id: str, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    _close_inference_sessions(kind="model", target_id=model_id)
+
     project_root = project_storage_root(project.storage_root)
     rel_dir = (Path("projects") / rec.project_id / "models" / rec.id).as_posix()
-    try:
-        path = resolve_storage_path(rel_dir, root=project_root)
-        if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        logger.debug("Failed to delete model artifacts (model_id=%s)", model_id, exc_info=True)
+    model_dir = resolve_storage_path(rel_dir, root=project_root)
+    model_cache_dir = (_resources_root_dir() / "deploy_cache" / rec.project_id / rec.id).resolve()
+
+    _remove_tree(model_dir, what="model")
+    _remove_tree(model_cache_dir, what="model deploy cache")
 
     db.delete(rec)
     db.commit()
@@ -3541,6 +4185,7 @@ def export_trained_model(
     workspace: int | None = Query(default=None, ge=0, le=65536),
     batch: int | None = Query(default=None, ge=1, le=1024),
     imgsz: int | None = Query(default=None, ge=32, le=8192),
+    end2end: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
     rec = db.get(TrainedModel, model_id)
@@ -3562,7 +4207,7 @@ def export_trained_model(
         return FileResponse(path=str(weights_path), filename=filename, media_type="application/octet-stream")
 
     try:
-        from ultralytics import YOLO  # type: ignore
+        YOLO = import_yolo()
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=503, detail=f"ultralytics is not available: {exc}") from exc
 
@@ -3574,39 +4219,33 @@ def export_trained_model(
     try:
         yolo = YOLO(str(weights_path))
 
-        export_kwargs: dict[str, object] = {"format": fmt}
+        export_kwargs: dict[str, object] = {
+            "format": fmt,
+            # Prefer exporting into a temporary directory to avoid leaving variants next to weights.
+            "project": str(tmp_dir),
+            "name": "export",
+            "exist_ok": True,
+            "save_dir": str(tmp_dir),
+            "half": bool(half),
+            "int8": bool(int8),
+            "end2end": bool(end2end),
+        }
         if fmt == "onnx":
             export_kwargs.update({"opset": opset, "simplify": simplify, "dynamic": dynamic})
+        if device and device.strip():
+            export_kwargs["device"] = device.strip()
+        if workspace is not None:
+            export_kwargs["workspace"] = int(workspace)
+        if batch is not None:
+            export_kwargs["batch"] = int(batch)
+        if imgsz is not None:
+            export_kwargs["imgsz"] = int(imgsz)
 
+        safe_export_kwargs = filter_kwargs_by_signature(yolo.export, export_kwargs)
         try:
-            sig = inspect.signature(yolo.export)
-            params = sig.parameters
-        except Exception:
-            params = {}
-
-        # Prefer exporting into a temporary directory to avoid leaving variants next to weights.
-        if "project" in params:
-            export_kwargs["project"] = str(tmp_dir)
-        if "name" in params:
-            export_kwargs["name"] = "export"
-        if "exist_ok" in params:
-            export_kwargs["exist_ok"] = True
-        if "save_dir" in params:
-            export_kwargs["save_dir"] = str(tmp_dir)
-        if device and "device" in params:
-            export_kwargs["device"] = device
-        if "half" in params:
-            export_kwargs["half"] = half
-        if "int8" in params:
-            export_kwargs["int8"] = int8
-        if workspace is not None and "workspace" in params:
-            export_kwargs["workspace"] = workspace
-        if batch is not None and "batch" in params:
-            export_kwargs["batch"] = batch
-        if imgsz is not None and "imgsz" in params:
-            export_kwargs["imgsz"] = imgsz
-
-        result = yolo.export(**export_kwargs)
+            result = yolo.export(**safe_export_kwargs)
+        except TypeError:
+            result = yolo.export(format=fmt)
 
         exported: Path | None = None
         if isinstance(result, (str, Path)):
@@ -3679,13 +4318,101 @@ def inference_status():
     return ApiResponse(code=200, message="OK", data=_inference_status_snapshot())
 
 
+def _session_out_from_runtime(session: InferenceSessionRuntime) -> InferenceSessionOut:
+    return InferenceSessionOut(
+        id=session.id,
+        project_id=session.project_id,
+        kind=session.kind,
+        target_id=session.target_id,
+        target_name=session.target_name,
+        model_id=session.target_id if session.kind == "model" else None,
+        format=session.format,
+        device=session.device,
+        end2end=bool(getattr(session, "end2end", False)),
+        created_at=session.created_at,
+        last_used_at=session.last_used_at,
+        cached_artifact=session.artifact_path.name if session.artifact_path else None,
+    )
+
+
+def _pipeline_snapshot_signature(steps: list[dict]) -> str:
+    payload = json.dumps(steps, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
 @app.post("/inference/sessions", response_model=ApiResponse[InferenceSessionOut])
 def create_inference_session(req: InferenceSessionCreateIn, db: Session = Depends(get_db)):
     active = _active_training_job()
     if active:
         raise HTTPException(status_code=409, detail=f"Training is in progress (job_id={active.id})")
 
-    rec = db.get(TrainedModel, req.model_id)
+    if req.kind == "pipeline":
+        pipeline_id = str(req.target_id or "").strip()
+        pipeline = db.get(Pipeline, pipeline_id)
+        if not pipeline:
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+        if req.project_id and pipeline.project_id != req.project_id:
+            raise HTTPException(status_code=400, detail="Pipeline does not belong to the selected project")
+
+        raw_steps = pipeline.steps or []
+        steps = [PipelineStepSpec.model_validate(s) for s in raw_steps]
+        if not steps:
+            raise HTTPException(status_code=400, detail="Pipeline has no steps")
+        steps_snapshot = [s.model_dump() for s in steps]
+        signature = _pipeline_snapshot_signature(steps_snapshot)
+        key = "|".join(
+            [
+                "pipeline",
+                pipeline.project_id,
+                pipeline.id,
+                signature,
+                f"device={(req.device or '').strip()}",
+            ]
+        )
+
+        try:
+            mode, existing = _INFER_REGISTRY.reserve_or_get(key)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        if mode == "existing" and existing is not None:
+            payload = ApiResponse(code=200, message="OK", data=_session_out_from_runtime(existing)).model_dump(mode="json")
+            return JSONResponse(status_code=200, content=payload)
+
+        created = None
+        err_msg: str | None = None
+        try:
+            created_at = _now_iso()
+            created = InferenceSessionRuntime(
+                id=str(uuid.uuid4()),
+                key=key,
+                kind="pipeline",
+                target_id=pipeline.id,
+                target_name=pipeline.name or pipeline.id,
+                project_id=pipeline.project_id,
+                format=None,
+                device=(req.device or "").strip() or None,
+                end2end=False,
+                artifact_path=None,
+                model=None,
+                created_at=created_at,
+                pipeline_steps_snapshot=steps_snapshot,
+            )
+            _INFER_REGISTRY.register_loaded(key, created)
+            payload = ApiResponse(code=201, message="Created", data=_session_out_from_runtime(created)).model_dump(mode="json")
+            return JSONResponse(status_code=201, content=payload)
+        except HTTPException as exc:
+            err_msg = str(exc.detail)
+            raise
+        except Exception as exc:  # pragma: no cover
+            err_msg = str(exc)
+            raise
+        finally:
+            _INFER_REGISTRY.finish_loading(key, error=err_msg)
+
+    # kind == "model"
+    model_id = str(req.target_id or "").strip()
+    rec = db.get(TrainedModel, model_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Model not found")
     if req.project_id and rec.project_id != req.project_id:
@@ -3700,11 +4427,14 @@ def create_inference_session(req: InferenceSessionCreateIn, db: Session = Depend
     if not weights_path.exists():
         raise HTTPException(status_code=404, detail="Weights not found on disk")
 
+    fmt = req.format or "tensorrt"
     key = "|".join(
         [
+            "model",
             str(weights_path.resolve()),
-            req.format,
+            fmt,
             (req.device or "").strip(),
+            "end2end=1" if req.end2end else "end2end=0",
             "half=1" if req.half else "half=0",
             "int8=1" if req.int8 else "int8=0",
             f"workspace={req.workspace or ''}",
@@ -3713,56 +4443,22 @@ def create_inference_session(req: InferenceSessionCreateIn, db: Session = Depend
         ]
     )
 
-    with _INFER_LOCK:
-        existing_id = _INFER_SESSION_BY_KEY.get(key)
-        if existing_id and existing_id in _INFER_SESSIONS:
-            s = _INFER_SESSIONS[existing_id]
-            out = InferenceSessionOut(
-                id=s.id,
-                project_id=s.project_id,
-                model_id=s.model_id,
-                format=s.format,
-                device=s.device,
-                created_at=s.created_at,
-                last_used_at=s.last_used_at,
-                cached_artifact=s.artifact_path.name,
-            )
-            return ApiResponse(code=200, message="OK", data=out)
-
-        evt = _INFER_LOADING.get(key)
-        if evt is None:
-            evt = threading.Event()
-            _INFER_LOADING[key] = evt
-            is_loader = True
-        else:
-            is_loader = False
-
-    if not is_loader:
-        evt.wait(timeout=1200)
-        with _INFER_LOCK:
-            existing_id = _INFER_SESSION_BY_KEY.get(key)
-            if existing_id and existing_id in _INFER_SESSIONS:
-                s = _INFER_SESSIONS[existing_id]
-                out = InferenceSessionOut(
-                    id=s.id,
-                    project_id=s.project_id,
-                    model_id=s.model_id,
-                    format=s.format,
-                    device=s.device,
-                    created_at=s.created_at,
-                    last_used_at=s.last_used_at,
-                    cached_artifact=s.artifact_path.name,
-                )
-                return ApiResponse(code=200, message="OK", data=out)
-            err = _INFER_LOADING_ERRORS.pop(key, None)
-        raise HTTPException(status_code=500, detail=err or "Inference session initialization failed")
-
     try:
-        cache_dir = _inference_cache_dir(project_root, rec.project_id, rec.id, req.format)
+        mode, existing = _INFER_REGISTRY.reserve_or_get(key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if mode == "existing" and existing is not None:
+        payload = ApiResponse(code=200, message="OK", data=_session_out_from_runtime(existing)).model_dump(mode="json")
+        return JSONResponse(status_code=200, content=payload)
+
+    err_msg: str | None = None
+    try:
+        cache_dir = _inference_cache_dir(project_root, rec.project_id, rec.id, fmt, bool(req.end2end))
         artifact = _ensure_inference_artifact(weights_path, cache_dir, req)
 
         try:
-            from ultralytics import YOLO  # type: ignore
+            YOLO = import_yolo()
         except Exception as exc:  # pragma: no cover
             raise HTTPException(status_code=503, detail=f"ultralytics is not available: {exc}") from exc
 
@@ -3770,66 +4466,47 @@ def create_inference_session(req: InferenceSessionCreateIn, db: Session = Depend
         try:
             model_obj = YOLO(str(artifact))
         except Exception:
-            # Best-effort fallback for OpenVINO directory-based loads.
-            if req.format == "openvino" and artifact.is_file():
+            if fmt == "openvino" and artifact.is_file():
                 model_obj = YOLO(str(artifact.parent))
             else:
                 raise
 
-        session_id = str(uuid.uuid4())
-        created_at = _now_iso()
-        session = _InferenceSession(
-            id=session_id,
+        created = InferenceSessionRuntime(
+            id=str(uuid.uuid4()),
             key=key,
+            kind="model",
+            target_id=rec.id,
+            target_name=rec.name or rec.id,
             project_id=rec.project_id,
-            model_id=rec.id,
-            format=req.format,
+            format=fmt,
             device=req.device,
+            end2end=bool(req.end2end),
             artifact_path=artifact,
             model=model_obj,
-            created_at=created_at,
+            created_at=_now_iso(),
+            pipeline_steps_snapshot=None,
         )
-
-        with _INFER_LOCK:
-            _INFER_SESSIONS[session_id] = session
-            _INFER_SESSION_BY_KEY[key] = session_id
-
-        out = InferenceSessionOut(
-            id=session_id,
-            project_id=session.project_id,
-            model_id=session.model_id,
-            format=session.format,
-            device=session.device,
-            created_at=created_at,
-            last_used_at=None,
-            cached_artifact=session.artifact_path.name,
-        )
-        return ApiResponse(code=201, message="Created", data=out)
+        _INFER_REGISTRY.register_loaded(key, created)
+        payload = ApiResponse(code=201, message="Created", data=_session_out_from_runtime(created)).model_dump(mode="json")
+        return JSONResponse(status_code=201, content=payload)
     except HTTPException as exc:
-        with _INFER_LOCK:
-            _INFER_LOADING_ERRORS[key] = str(exc.detail)
+        err_msg = str(exc.detail)
         raise
     except Exception as exc:  # pragma: no cover
-        with _INFER_LOCK:
-            _INFER_LOADING_ERRORS[key] = str(exc)
+        err_msg = str(exc)
         raise
     finally:
-        with _INFER_LOCK:
-            evt2 = _INFER_LOADING.pop(key, None)
-            if evt2:
-                evt2.set()
+        _INFER_REGISTRY.finish_loading(key, error=err_msg)
 
 
 @app.delete("/inference/sessions/{session_id}", response_model=ApiResponse[None])
 def close_inference_session(session_id: str):
-    with _INFER_LOCK:
-        session = _INFER_SESSIONS.get(session_id)
-        if not session or not isinstance(session, _InferenceSession):
-            raise HTTPException(status_code=404, detail="Inference session not found")
-        if session.active_requests > 0:
-            raise HTTPException(status_code=409, detail="Inference session is busy")
-        _INFER_SESSIONS.pop(session_id, None)
-        _INFER_SESSION_BY_KEY.pop(session.key, None)
+    try:
+        _INFER_REGISTRY.close(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Inference session not found") from None
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return ApiResponse(code=200, message="Closed", data=None)
 
 
@@ -3842,117 +4519,148 @@ def inference_predict(
     iou: float = Query(default=0.7, ge=0.0, le=1.0),
     imgsz: int | None = Query(default=None, ge=32, le=8192),
     classes: str | None = Query(default=None, max_length=200),
+    verbose: bool = Query(default=False),
+    db: Session = Depends(get_db),
 ):
     active = _active_training_job()
     if active:
         raise HTTPException(status_code=409, detail=f"Training is in progress (job_id={active.id})")
 
-    with _INFER_LOCK:
-        session = _INFER_SESSIONS.get(session_id)
-        if not session or not isinstance(session, _InferenceSession):
-            raise HTTPException(status_code=404, detail="Inference session not found")
-        global _INFER_ACTIVE_REQUESTS
-        _INFER_ACTIVE_REQUESTS += 1
-        session.active_requests += 1
+    try:
+        session = _INFER_REGISTRY.begin_request(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Inference session not found") from None
 
     detections: list[ModelEvaluationDetectionOut] = []
+    merged_detections: list[ModelEvaluationDetectionOut] = []
+    steps_out: list[PipelineRunStepOut] | None = None
     note: str | None = None
 
-    suffix = Path(file.filename or "image").suffix
-    if not suffix:
-        suffix = ".jpg"
-    fd, tmp_name = tempfile.mkstemp(prefix="infer_", suffix=suffix)
     try:
-        os.close(fd)
-    except Exception:
-        logger.debug("Failed to close temp fd for inference upload", exc_info=True)
-    tmp = Path(tmp_name).resolve()
-    try:
-        with tmp.open("wb") as f:
-            while True:
-                chunk = file.file.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-
-        with session.lock:
+        if session.kind == "pipeline":
+            raw = file.file.read()
             try:
-                predict_kwargs: dict[str, object] = {"verbose": False, "conf": conf, "max_det": max_det, "iou": iou}
-                if imgsz is not None:
-                    predict_kwargs["imgsz"] = int(imgsz)
-                if session.device:
-                    predict_kwargs["device"] = session.device
-                if classes:
-                    selected: list[int] = []
-                    for part in str(classes).split(","):
-                        part = part.strip()
-                        if not part:
-                            continue
-                        try:
-                            selected.append(int(part))
-                        except ValueError:
-                            continue
-                    if selected:
-                        predict_kwargs["classes"] = selected
+                image = Image.open(io.BytesIO(raw)).convert("RGB")
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid image file: {exc}") from exc
 
-                yolo = session.model
-                try:
-                    if hasattr(yolo, "predict"):
-                        results = yolo.predict(str(tmp), **predict_kwargs)  # type: ignore[attr-defined]
-                    else:
-                        results = yolo(str(tmp), **predict_kwargs)  # type: ignore[misc]
-                except TypeError:
-                    safe_kwargs = {"verbose": False, "conf": conf}
-                    if hasattr(yolo, "predict"):
-                        results = yolo.predict(str(tmp), **safe_kwargs)  # type: ignore[attr-defined]
-                    else:
-                        results = yolo(str(tmp), **safe_kwargs)  # type: ignore[misc]
+            steps_raw = session.pipeline_steps_snapshot or []
+            pipeline_steps = [PipelineStepSpec.model_validate(s) for s in steps_raw]
+            run_out = run_pipeline_runtime_steps(
+                project_id=session.project_id,
+                pipeline_id=session.target_id,
+                steps=pipeline_steps,
+                image=image,
+                db=db,
+                get_pipeline_model=_get_pipeline_model,
+                active_training_job=_active_training_job,
+            )
+            detections = list(run_out.final_detections or [])
+            merged_detections = list(run_out.merged_detections or [])
+            note = run_out.note
+            if verbose:
+                steps_out = list(run_out.steps or [])
+        else:
+            suffix = Path(file.filename or "image").suffix
+            if not suffix:
+                suffix = ".jpg"
+            fd, tmp_name = tempfile.mkstemp(prefix="infer_", suffix=suffix)
+            try:
+                os.close(fd)
+            except Exception:
+                logger.debug("Failed to close temp fd for inference upload", exc_info=True)
 
-                for result in results:
-                    boxes = getattr(result, "boxes", None)
-                    if not boxes:
-                        continue
-                    for box in boxes:
-                        detection = None
-                        try:
-                            x1, y1, x2, y2 = box.xyxy[0].tolist()
-                            conf_val = float(box.conf[0].item())
-                            cls_val = int(box.cls[0].item())
-                            names = getattr(result, "names", {}) or {}
-                            class_name = str(names.get(cls_val, cls_val))
-                            detection = ModelEvaluationDetectionOut(
-                                bbox=(float(x1), float(y1), float(x2), float(y2)),
-                                confidence=conf_val,
-                                class_name=class_name,
-                                class_id=cls_val,
-                            )
-                        except Exception as exc:
-                            logger.debug(
-                                "Failed to parse inference detection (session_id=%s): %s",
-                                session_id,
-                                exc,
-                                exc_info=True,
-                            )
-                        if detection is None:
+            tmp = Path(tmp_name).resolve()
+            with tmp.open("wb") as f:
+                while True:
+                    chunk = file.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+
+            try:
+                with session.lock:
+                    predict_kwargs: dict[str, object] = {"verbose": False, "conf": conf, "max_det": max_det, "iou": iou}
+                    if imgsz is not None:
+                        predict_kwargs["imgsz"] = int(imgsz)
+                    if session.device:
+                        predict_kwargs["device"] = session.device
+                    predict_kwargs["end2end"] = bool(getattr(session, "end2end", False))
+                    if classes:
+                        selected: list[int] = []
+                        for part in str(classes).split(","):
+                            part = part.strip()
+                            if not part:
+                                continue
+                            try:
+                                selected.append(int(part))
+                            except ValueError:
+                                continue
+                        if selected:
+                            predict_kwargs["classes"] = selected
+
+                    yolo = session.model
+                    try:
+                        call_fn = yolo.predict if hasattr(yolo, "predict") else yolo
+                        if hasattr(yolo, "predict"):
+                            results = call_fn(str(tmp), **filter_kwargs_by_signature(call_fn, predict_kwargs))  # type: ignore[attr-defined]
+                        else:
+                            results = call_fn(str(tmp), **filter_kwargs_by_signature(call_fn, predict_kwargs))  # type: ignore[misc]
+                    except TypeError:
+                        safe_kwargs = {"verbose": False, "conf": conf}
+                        call_fn = yolo.predict if hasattr(yolo, "predict") else yolo
+                        results = call_fn(str(tmp), **filter_kwargs_by_signature(call_fn, safe_kwargs))  # type: ignore[misc]
+
+                    for result in results:
+                        boxes = getattr(result, "boxes", None)
+                        if not boxes:
                             continue
-                        detections.append(detection)
+                        for box in boxes:
+                            detection = None
+                            try:
+                                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                                conf_val = float(box.conf[0].item())
+                                cls_val = int(box.cls[0].item())
+                                names = getattr(result, "names", {}) or {}
+                                class_name = str(names.get(cls_val, cls_val))
+                                detection = ModelEvaluationDetectionOut(
+                                    bbox=(float(x1), float(y1), float(x2), float(y2)),
+                                    confidence=conf_val,
+                                    class_name=class_name,
+                                    class_id=cls_val,
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "Failed to parse inference detection (session_id=%s): %s",
+                                    session_id,
+                                    exc,
+                                    exc_info=True,
+                                )
+                            if detection is None:
+                                continue
+                            detections.append(detection)
             except Exception as exc:
                 logger.debug("Inference predict failed (session_id=%s): %s", session_id, exc, exc_info=True)
                 note = str(exc)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    logger.debug("Failed to cleanup inference temp file: %s", tmp, exc_info=True)
 
-        detections.sort(key=lambda d: d.confidence, reverse=True)
-        if len(detections) > max_det:
-            detections = detections[:max_det]
+            detections.sort(key=lambda d: d.confidence, reverse=True)
+            if len(detections) > max_det:
+                detections = detections[:max_det]
+            merged_detections = list(detections)
 
-        with _INFER_LOCK:
-            session.last_used_at = _now_iso()
-        return ApiResponse(code=200, message="OK", data=InferencePredictionOut(session_id=session_id, detections=detections, note=note))
+        _INFER_REGISTRY.touch(session_id, _now_iso())
+        payload = InferencePredictionOut(
+            session_id=session_id,
+            detections=detections,
+            merged_detections=merged_detections,
+            steps=steps_out if verbose else None,
+            note=note,
+        )
+        return ApiResponse(code=200, message="OK", data=payload)
     finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            logger.debug("Failed to cleanup inference temp file: %s", tmp, exc_info=True)
-        with _INFER_LOCK:
-            _INFER_ACTIVE_REQUESTS = max(0, _INFER_ACTIVE_REQUESTS - 1)
-            if session_id in _INFER_SESSIONS and isinstance(_INFER_SESSIONS[session_id], _InferenceSession):
-                _INFER_SESSIONS[session_id].active_requests = max(0, _INFER_SESSIONS[session_id].active_requests - 1)
+        _INFER_REGISTRY.end_request(session_id)

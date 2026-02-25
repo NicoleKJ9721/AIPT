@@ -31,6 +31,7 @@ logs/
 # IDE / OS
 .idea/
 .vscode/
+.openclaw/
 .DS_Store
 Thumbs.db
 
@@ -42,4 +43,3 @@ Thumbs.db
 storage/
 backend/storage/
 *.db
-

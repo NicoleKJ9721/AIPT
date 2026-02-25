@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
+from collections import deque
 from pathlib import Path
 
 
@@ -138,47 +139,99 @@ def _simplify_polygon(poly: list[tuple[float, float]], tolerance: float) -> list
 
 def _mask_to_polygon(mask: "object", simplify: float) -> tuple[list[float], int]:
     import numpy as np  # local import
-    from skimage.measure import approximate_polygon, find_contours  # type: ignore
-    from skimage.morphology import closing, disk, opening  # type: ignore
 
     arr = np.asarray(mask, dtype=np.uint8)
     if arr.ndim != 2:
         raise SmartSegmentError(status_code=422, detail="Invalid mask shape")
 
     mask_bool = arr.astype(bool)
-    if int(mask_bool.sum()) < 20:
+    area = int(mask_bool.sum())
+    if area < 20:
         raise SmartSegmentError(status_code=422, detail="No region found; try another point or adjust threshold")
 
-    # Light smoothing.
-    mask_bool = opening(mask_bool, disk(1))
-    mask_bool = closing(mask_bool, disk(2))
+    try:
+        from skimage.measure import approximate_polygon, find_contours  # type: ignore
+        from skimage.morphology import closing, disk, opening  # type: ignore
 
-    contours = find_contours(mask_bool.astype(np.uint8), 0.5)
-    if not contours:
-        raise SmartSegmentError(status_code=422, detail="Failed to extract contour")
+        # Light smoothing.
+        mask_bool = opening(mask_bool, disk(1))
+        mask_bool = closing(mask_bool, disk(2))
 
-    contour = max(contours, key=lambda c: c.shape[0])
-    approx = approximate_polygon(contour, tolerance=simplify) if simplify > 0 else contour
-    if approx is None or len(approx) < 3:
-        raise SmartSegmentError(status_code=422, detail="Polygon too small")
+        contours = find_contours(mask_bool.astype(np.uint8), 0.5)
+        if not contours:
+            raise SmartSegmentError(status_code=422, detail="Failed to extract contour")
 
-    points: list[float] = []
-    for row, col in approx:
-        points.append(float(col))
-        points.append(float(row))
+        contour = max(contours, key=lambda c: c.shape[0])
+        approx = approximate_polygon(contour, tolerance=simplify) if simplify > 0 else contour
+        if approx is None or len(approx) < 3:
+            raise SmartSegmentError(status_code=422, detail="Polygon too small")
 
-    if len(points) < 6:
-        raise SmartSegmentError(status_code=422, detail="Polygon too small")
+        points: list[float] = []
+        for row, col in approx:
+            points.append(float(col))
+            points.append(float(row))
 
-    area = int(mask_bool.sum())
-    return points, area
+        if len(points) < 6:
+            raise SmartSegmentError(status_code=422, detail="Polygon too small")
+        return points, int(mask_bool.sum())
+    except SmartSegmentError:
+        raise
+    except Exception:
+        # Fallback without skimage: use tight bbox polygon.
+        ys, xs = np.where(mask_bool)
+        if ys.size == 0 or xs.size == 0:
+            raise SmartSegmentError(status_code=422, detail="No region found; try another point or adjust threshold")
+        x1 = float(xs.min())
+        y1 = float(ys.min())
+        x2 = float(xs.max())
+        y2 = float(ys.max())
+        points = [x1, y1, x2, y1, x2, y2, x1, y2]
+        return points, area
+
+
+def _flood_fill_tolerance(arr: "object", seed_y: int, seed_x: int, tol: float):
+    import numpy as np  # local import
+
+    img = np.asarray(arr, dtype=np.float32)
+    h, w = img.shape[:2]
+    mask = np.zeros((h, w), dtype=bool)
+    visited = np.zeros((h, w), dtype=bool)
+    base = float(img[seed_y, seed_x])
+    q: deque[tuple[int, int]] = deque([(seed_y, seed_x)])
+    visited[seed_y, seed_x] = True
+
+    while q:
+        y, x = q.popleft()
+        if abs(float(img[y, x]) - base) > tol:
+            continue
+        mask[y, x] = True
+        if y > 0 and not visited[y - 1, x]:
+            visited[y - 1, x] = True
+            q.append((y - 1, x))
+        if y + 1 < h and not visited[y + 1, x]:
+            visited[y + 1, x] = True
+            q.append((y + 1, x))
+        if x > 0 and not visited[y, x - 1]:
+            visited[y, x - 1] = True
+            q.append((y, x - 1))
+        if x + 1 < w and not visited[y, x + 1]:
+            visited[y, x + 1] = True
+            q.append((y, x + 1))
+
+    return mask
 
 
 def _segment_flood(image_path: Path, point: tuple[float, float], tolerance: float, simplify: float) -> tuple[list[float], int]:
     try:
         import numpy as np  # local import
         from PIL import Image
-        from skimage.segmentation import flood  # type: ignore
+        flood = None
+        try:
+            from skimage.segmentation import flood as sk_flood  # type: ignore
+
+            flood = sk_flood
+        except Exception:
+            flood = None
     except Exception as exc:
         raise SmartSegmentError(status_code=503, detail=f"Smart segment dependency missing: {exc}") from exc
 
@@ -193,7 +246,10 @@ def _segment_flood(image_path: Path, point: tuple[float, float], tolerance: floa
     y = int(max(0, min(h - 1, round(float(py)))))
 
     tol = _clamp01(float(tolerance))
-    mask = flood(arr, (y, x), tolerance=tol)
+    if flood is not None:
+        mask = flood(arr, (y, x), tolerance=tol)
+    else:
+        mask = _flood_fill_tolerance(arr, y, x, tol)
     if mask is None:
         raise SmartSegmentError(status_code=422, detail="No region found; try another point or increase tolerance")
 

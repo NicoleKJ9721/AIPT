@@ -250,14 +250,50 @@ class TrainedModel(Base):
         nullable=True,
         index=True,
     )
+    parent_model_id: Mapped[str | None] = mapped_column(
+        String,
+        ForeignKey("trained_models.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     name: Mapped[str] = mapped_column(String, nullable=False, default="model")
-    base_model: Mapped[str] = mapped_column(String, nullable=False, default="yolov8m")
+    base_model: Mapped[str] = mapped_column(String, nullable=False, default="yolo26m")
+    train_mode: Mapped[str] = mapped_column(String, nullable=False, default="transfer")
+    train_config: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
 
     # Relative to the project's storage root (same convention as dataset_files.storage_path).
     weights_path: Mapped[str] = mapped_column(String, nullable=False)
     results_path: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        onupdate=_utcnow,
+    )
+
+
+class Pipeline(Base):
+    __tablename__ = "pipelines"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    name: Mapped[str] = mapped_column(String, nullable=False, default="pipeline")
+    description: Mapped[str] = mapped_column(String, nullable=False, default="")
+    steps: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True, default=None)
 
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True),

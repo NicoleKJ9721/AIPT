@@ -148,7 +148,62 @@ $xaml = @"
         Width="920" Height="520"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize"
-        Background="#0B1220">
+        Background="#0B1220"
+        FontFamily="Segoe UI">
+  <Window.Resources>
+    <Style TargetType="TextBlock">
+      <Setter Property="TextOptions.TextRenderingMode" Value="ClearType"/>
+      <Setter Property="TextOptions.TextFormattingMode" Value="Display"/>
+    </Style>
+
+    <Style x:Key="BaseButton" TargetType="Button">
+      <Setter Property="Foreground" Value="#F2FFFFFF"/>
+      <Setter Property="Background" Value="#1CFFFFFF"/>
+      <Setter Property="BorderBrush" Value="#33FFFFFF"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="12,6"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd"
+                    CornerRadius="8"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#2AFFFFFF"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#3AFFFFFF"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="Bd" Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="Button" BasedOn="{StaticResource BaseButton}"/>
+    <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource BaseButton}">
+      <Setter Property="Background" Value="#2563EB"/>
+      <Setter Property="BorderBrush" Value="#3B82F6"/>
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style x:Key="DangerButton" TargetType="Button" BasedOn="{StaticResource BaseButton}">
+      <Setter Property="Background" Value="#DC2626"/>
+      <Setter Property="BorderBrush" Value="#EF4444"/>
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+  </Window.Resources>
   <Grid>
     <Image x:Name="BgImage" Stretch="Fill" />
     <Border Margin="22"
@@ -159,6 +214,9 @@ $xaml = @"
             BorderBrush="#33FFFFFF"
             BorderThickness="1"
             Padding="16">
+      <Border.Effect>
+        <DropShadowEffect Color="#000000" BlurRadius="18" ShadowDepth="0" Opacity="0.35"/>
+      </Border.Effect>
       <Grid>
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto"/>
@@ -180,8 +238,10 @@ $xaml = @"
           <CheckBox x:Name="ChkBrowser" Content="打开浏览器" IsChecked="True" Foreground="#E8FFFFFF"/>
         </StackPanel>
 
-        <ProgressBar x:Name="Progress" Grid.Row="2" Height="10" Margin="0,12,0,0" Minimum="0" Maximum="8"
-                     Background="#1AFFFFFF" Foreground="#22C55E" BorderThickness="0"/>
+        <Border Grid.Row="2" Margin="0,12,0,0" Height="10" CornerRadius="6" Background="#1AFFFFFF">
+          <ProgressBar x:Name="Progress" Minimum="0" Maximum="8"
+                       Background="Transparent" Foreground="#22C55E" BorderThickness="0"/>
+        </Border>
 
         <Grid Grid.Row="3" Margin="0,12,0,0">
           <Grid.RowDefinitions>
@@ -189,7 +249,7 @@ $xaml = @"
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
           <Border Grid.Row="0" Background="#0FFFFFFF" CornerRadius="10" Padding="10">
-            <ListBox x:Name="StepsList" Background="Transparent" BorderThickness="0" Foreground="#E8FFFFFF" FontSize="12"/>
+            <ListBox x:Name="StepsList" IsHitTestVisible="False" Background="Transparent" BorderThickness="0" Foreground="#E8FFFFFF" FontSize="12"/>
           </Border>
           <Border Grid.Row="1" Background="#0FFFFFFF" CornerRadius="10" Padding="10" Margin="0,12,0,0">
             <TextBox x:Name="LogBox" Background="Transparent" BorderThickness="0" Foreground="#C8FFFFFF"
@@ -199,9 +259,9 @@ $xaml = @"
         </Grid>
 
         <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
-          <Button x:Name="BtnOpen" Content="打开平台" Padding="12,6" Margin="0,0,10,0" IsEnabled="False"/>
-          <Button x:Name="BtnStop" Content="停止服务" Padding="12,6" Margin="0,0,10,0" IsEnabled="False"/>
-          <Button x:Name="BtnClose" Content="关闭" Padding="12,6" IsEnabled="False"/>
+          <Button x:Name="BtnOpen" Style="{StaticResource PrimaryButton}" Content="打开平台" Margin="0,0,10,0" IsEnabled="False"/>
+          <Button x:Name="BtnStop" Style="{StaticResource DangerButton}" Content="停止服务" Margin="0,0,10,0" IsEnabled="False"/>
+          <Button x:Name="BtnClose" Content="关闭" IsEnabled="False"/>
         </StackPanel>
 
         <TextBlock Grid.Row="5" Margin="0,10,0,0" Foreground="#88FFFFFF" FontSize="11"
@@ -817,11 +877,30 @@ $backgroundScript = {
             $sync.BtnClose.IsEnabled = $true
 
             try {
+                try { $sync.StatusText.Foreground = [System.Windows.Media.Brushes]::PaleGreen } catch {}
                 $sync.CloseTimer = New-Object System.Windows.Threading.DispatcherTimer
-                $sync.CloseTimer.Interval = [TimeSpan]::FromSeconds(2)
+                $sync.CloseTimer.Interval = [TimeSpan]::FromSeconds(1.2)
                 $sync.CloseTimer.Add_Tick({
                     try { $sync.CloseTimer.Stop() } catch {}
-                    try { $sync.Window.Close() } catch {}
+                    try {
+                        $sync.FadeTimer = New-Object System.Windows.Threading.DispatcherTimer
+                        $sync.FadeTimer.Interval = [TimeSpan]::FromMilliseconds(25)
+                        $sync.FadeTimer.Add_Tick({
+                            try {
+                                $sync.Window.Opacity = [Math]::Max(0, $sync.Window.Opacity - 0.08)
+                                if ($sync.Window.Opacity -le 0.05) {
+                                    try { $sync.FadeTimer.Stop() } catch {}
+                                    try { $sync.Window.Close() } catch {}
+                                }
+                            } catch {
+                                try { $sync.FadeTimer.Stop() } catch {}
+                                try { $sync.Window.Close() } catch {}
+                            }
+                        })
+                        $sync.FadeTimer.Start()
+                    } catch {
+                        try { $sync.Window.Close() } catch {}
+                    }
                 })
                 $sync.CloseTimer.Start()
             } catch {
@@ -834,6 +913,7 @@ $backgroundScript = {
         Log "FAILED: $($err.Exception.Message)"
         Set-Status "启动失败（请查看日志）"
         UIAction {
+            try { $sync.StatusText.Foreground = [System.Windows.Media.Brushes]::Salmon } catch {}
             $sync.BtnStop.IsEnabled = $true
             $sync.BtnClose.IsEnabled = $true
         }

@@ -253,6 +253,22 @@ function nextShortcut(existing: LabelClass[]): string {
   return String(existing.length + 1);
 }
 
+function rectIou(a: [number, number, number, number], b: [number, number, number, number]): number {
+  const ix1 = Math.max(a[0], b[0]);
+  const iy1 = Math.max(a[1], b[1]);
+  const ix2 = Math.min(a[2], b[2]);
+  const iy2 = Math.min(a[3], b[3]);
+  const iw = Math.max(0, ix2 - ix1);
+  const ih = Math.max(0, iy2 - iy1);
+  const inter = iw * ih;
+  if (inter <= 0) return 0;
+  const areaA = Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1]);
+  const areaB = Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
+  const denom = areaA + areaB - inter;
+  if (denom <= 0) return 0;
+  return inter / denom;
+}
+
 function ensureClassesIncludeLabels(existing: LabelClass[], labels: string[]): LabelClass[] {
   const wanted = labels.map(normalizeLabel).filter(Boolean);
   if (!wanted.length) return existing;
@@ -326,12 +342,17 @@ export default function AnnotationStudio() {
   const [smartDetectMaxDet, setSmartDetectMaxDet] = useState(20);
   const [smartDetectMinDistance, setSmartDetectMinDistance] = useState<string>("");
   const [smartDetectDedupIou, setSmartDetectDedupIou] = useState(0.8);
+  const [smartDetectOnlyUnannotated, setSmartDetectOnlyUnannotated] = useState(true);
   const smartDetectStartRef = useRef<{ x: number; y: number } | null>(null);
   const [smartDetectDraft, setSmartDetectDraft] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
 
   const [smartSegTolerance, setSmartSegTolerance] = useState(0.08);
   const [smartSegSimplify, setSmartSegSimplify] = useState(2.0);
   const [smartSegEngine, setSmartSegEngine] = useState("auto");
+  const [autoLabelConf, setAutoLabelConf] = useState(0.25);
+  const [autoLabelIou, setAutoLabelIou] = useState(0.7);
+  const [autoLabelMaxDet, setAutoLabelMaxDet] = useState(50);
+  const [autoLabelDedupIou, setAutoLabelDedupIou] = useState(0.8);
 
   const cancelSmartMode = useCallback(() => {
     smartDetectStartRef.current = null;
@@ -543,7 +564,7 @@ export default function AnnotationStudio() {
         console.error(err);
         toast({
           title: "加载项目失败",
-          description: "请检查后端服务是否启动（http://127.0.0.1:8000）",
+          description: "请检查后端服务是否已启动（http://127.0.0.1:8000）",
           variant: "destructive",
         });
       } finally {
@@ -774,98 +795,117 @@ export default function AnnotationStudio() {
 
   const handleAIAutoLabel = async () => {
     try {
-        const currentImage = imageList[currentImageIndex];
-        if (!currentImage?.url) {
-            toast({
-                title: "暂无可标注图片",
-                description: "请先在数据集模块导入图片后再进行标注",
-                variant: "destructive",
-            });
-            return;
-        }
-        // Fetch image as blob
-        const response = await fetch(currentImage.url);
-        const blob = await response.blob();
-        const file = new File([blob], currentImage.name, { type: blob.type });
+      const currentImage = imageList[currentImageIndex];
+      if (!currentImage?.url) {
+        toast({
+          title: "暂无可标注图片",
+          description: "请先在数据集模块导入图片后再进行标注",
+          variant: "destructive",
+        });
+        return;
+      }
 
-        const result = await aiService.predict(file);
+      const response = await fetch(currentImage.url);
+      const blob = await response.blob();
+      const file = new File([blob], currentImage.name, { type: blob.type });
 
-        const detectedLabels = Array.from(
-            new Set(result.detections.map((det) => normalizeLabel(det.class)).filter(Boolean))
-        );
+      const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+      const conf = clamp01(Number(autoLabelConf) || 0.25);
+      const iou = clamp01(Number(autoLabelIou) || 0.7);
+      const maxDet = Math.max(1, Math.floor(Number(autoLabelMaxDet) || 50));
+      const result = await aiService.predict(file, { conf, iou, max_det: maxDet });
 
-        const byName = new Map(classes.map((c) => [normalizeLabel(c.name), c] as const));
-        const createdClasses: LabelClass[] = [];
-        if (detectedLabels.length > 0) {
-            for (const name of detectedLabels) {
-                if (byName.has(name)) continue;
-                const color = pickDistinctColor([...classes, ...createdClasses].map((c) => c.color));
-                const shortcut = nextShortcut([...classes, ...createdClasses]);
+      const detectedLabels = Array.from(new Set(result.detections.map((det) => normalizeLabel(det.class)).filter(Boolean)));
+      const byName = new Map(classes.map((c) => [normalizeLabel(c.name), c] as const));
+      const createdClasses: LabelClass[] = [];
+      if (detectedLabels.length > 0) {
+        for (const name of detectedLabels) {
+          if (byName.has(name)) continue;
+          const color = pickDistinctColor([...classes, ...createdClasses].map((c) => c.color));
+          const shortcut = nextShortcut([...classes, ...createdClasses]);
 
-                if (activeProjectId) {
-                    try {
-                        const created = await labelService.create(activeProjectId, { name, color, shortcut });
-                        const nextClass = toFrontendLabelClass(created);
-                        createdClasses.push(nextClass);
-                        byName.set(normalizeLabel(nextClass.name), nextClass);
-                    } catch (error) {
-                        console.error("Create label for AI detections failed:", error);
-                        const nextClass: LabelClass = {
-                            id: `cls_${hashString(name)}_${Date.now()}`,
-                            name,
-                            color,
-                            shortcut,
-                        };
-                        createdClasses.push(nextClass);
-                        byName.set(normalizeLabel(nextClass.name), nextClass);
-                    }
-                } else {
-                    const nextClass: LabelClass = {
-                        id: `cls_${hashString(name)}_${Date.now()}`,
-                        name,
-                        color,
-                        shortcut,
-                    };
-                    createdClasses.push(nextClass);
-                    byName.set(normalizeLabel(nextClass.name), nextClass);
-                }
+          if (activeProjectId) {
+            try {
+              const created = await labelService.create(activeProjectId, { name, color, shortcut });
+              const nextClass = toFrontendLabelClass(created);
+              createdClasses.push(nextClass);
+              byName.set(normalizeLabel(nextClass.name), nextClass);
+            } catch (error) {
+              console.error("Create label for AI detections failed:", error);
+              const nextClass: LabelClass = {
+                id: `cls_${hashString(name)}_${Date.now()}`,
+                name,
+                color,
+                shortcut,
+              };
+              createdClasses.push(nextClass);
+              byName.set(normalizeLabel(nextClass.name), nextClass);
             }
-        }
-        if (createdClasses.length > 0) {
-            setClasses((prev) => [...prev, ...createdClasses]);
-        }
-
-        const newAnnotations: Annotation[] = result.detections.map((det) => {
-            const label = normalizeLabel(det.class) || "unknown";
-            const labelClass = byName.get(label) || classes[0];
-            return {
-                id: uuidv4(),
-                type: "rect",
-                x: det.bbox[0],
-                y: det.bbox[1],
-                width: det.bbox[2] - det.bbox[0],
-                height: det.bbox[3] - det.bbox[1],
-                label,
-                color: labelClass.color,
-                visible: true
+          } else {
+            const nextClass: LabelClass = {
+              id: `cls_${hashString(name)}_${Date.now()}`,
+              name,
+              color,
+              shortcut,
             };
-        });
+            createdClasses.push(nextClass);
+            byName.set(normalizeLabel(nextClass.name), nextClass);
+          }
+        }
+      }
+      if (createdClasses.length > 0) {
+        setClasses((prev) => [...prev, ...createdClasses]);
+      }
 
-        addToHistory([...annotations, ...newAnnotations]);
-        toast({
-            title: "AI 自动标注完成",
-            description: `已识别 ${newAnnotations.length} 个目标`,
-        });
+      const dedupIou = clamp01(Number(autoLabelDedupIou) || 0.8);
+      const existingRects = annotations
+        .filter((a) => a.type === "rect" && typeof a.x === "number" && typeof a.y === "number" && typeof a.width === "number" && typeof a.height === "number")
+        .map((a) => [Number(a.x), Number(a.y), Number(a.x) + Number(a.width), Number(a.y) + Number(a.height)] as [number, number, number, number]);
+      const newRects: Array<[number, number, number, number]> = [];
+      const sortedDets = [...result.detections].sort((a, b) => (Number(b.confidence) || 0) - (Number(a.confidence) || 0));
+
+      const newAnnotations: Annotation[] = sortedDets.flatMap((det) => {
+        const x1 = Number(det.bbox[0]) || 0;
+        const y1 = Number(det.bbox[1]) || 0;
+        const x2 = Number(det.bbox[2]) || 0;
+        const y2 = Number(det.bbox[3]) || 0;
+        if (x2 <= x1 || y2 <= y1) return [];
+        const rect: [number, number, number, number] = [x1, y1, x2, y2];
+        if (existingRects.some((r) => rectIou(rect, r) >= dedupIou)) return [];
+        if (newRects.some((r) => rectIou(rect, r) >= dedupIou)) return [];
+        newRects.push(rect);
+
+        const label = normalizeLabel(det.class) || "unknown";
+        const labelClass = byName.get(label) || classes[0];
+        return [
+          {
+            id: uuidv4(),
+            type: "rect",
+            x: x1,
+            y: y1,
+            width: x2 - x1,
+            height: y2 - y1,
+            label,
+            color: labelClass.color,
+            visible: true,
+          },
+        ];
+      });
+
+      addToHistory([...annotations, ...newAnnotations]);
+      toast({
+        title: "模型自动标注完成",
+        description: `新增 ${newAnnotations.length} 个目标（阈值 conf=${conf.toFixed(2)}, 去重 IoU=${dedupIou.toFixed(2)}）`,
+      });
     } catch (error) {
-        console.error("AI Auto Label Error:", error);
-        toast({
-            title: "AI 标注失败",
-            description: "请检查后端服务是否启动",
-            variant: "destructive",
-        });
+      console.error("AI Auto Label Error:", error);
+      toast({
+        title: "模型自动标注失败",
+        description: "请检查后端服务、模型加载状态和控制台日志",
+        variant: "destructive",
+      });
     }
   };
-
   const saveCurrentAnnotations = useCallback(
     async (opts?: { silent?: boolean; annotationsOverride?: Annotation[] }): Promise<boolean> => {
       if (!currentImageId) return true;
@@ -978,6 +1018,7 @@ export default function AnnotationStudio() {
           max_det_per_image: Math.max(1, Math.floor(Number(smartDetectMaxDet) || 20)),
           min_distance: Number.isFinite(minDistance as number) ? Math.max(1, Math.floor(minDistance as number)) : undefined,
           dedup_iou: clamp01(Number(smartDetectDedupIou) || 0.8),
+          only_unannotated: smartDetectOnlyUnannotated,
         });
 
         const fresh = await annotationService.listByImage(currentImageId);
@@ -990,7 +1031,7 @@ export default function AnnotationStudio() {
 
         toast({
           title: "智能检测完成",
-          description: `处理 ${result.processed_images} 张图，新增 ${result.created_annotations} 个标注`,
+          description: `处理 ${result.processed_images} 张图，新增 ${result.created_annotations} 个标注${result.skipped_images ? `，跳过 ${result.skipped_images} 张` : ""}`,
         });
       } catch (error) {
         console.error("Smart detect failed:", error);
@@ -1015,6 +1056,7 @@ export default function AnnotationStudio() {
       smartDetectMaxDet,
       smartDetectMaxImages,
       smartDetectMinDistance,
+      smartDetectOnlyUnannotated,
       smartDetectScope,
       smartDetectThreshold,
     ]
@@ -1997,14 +2039,18 @@ export default function AnnotationStudio() {
                       <SelectValue placeholder="选择标签" />
                     </SelectTrigger>
                     <SelectContent>
-                      {classes.map((c) => (
-                        <SelectItem key={c.id} value={c.id}>
-                          <span className="flex items-center gap-2">
-                            <span className="inline-block w-2 h-2 rounded-full" style={{ background: c.color }} />
-                            <span className="truncate">{c.name}</span>
-                          </span>
-                        </SelectItem>
-                      ))}
+                      {classes.length === 0 ? (
+                        <div className="px-2 py-1.5 text-sm text-muted-foreground">暂无可用标签</div>
+                      ) : (
+                        classes.map((c) => (
+                          <SelectItem key={c.id} value={c.id}>
+                            <span className="flex items-center gap-2">
+                              <span className="inline-block w-2 h-2 rounded-full" style={{ background: c.color }} />
+                              <span className="truncate">{c.name}</span>
+                            </span>
+                          </SelectItem>
+                        ))
+                      )}
                     </SelectContent>
                   </Select>
                 </div>
@@ -2021,20 +2067,6 @@ export default function AnnotationStudio() {
                 {smartTab === "detect" ? (
                   <div className="space-y-3">
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                      <div className="space-y-1 md:col-span-2">
-                        <div className="text-xs text-muted-foreground">分割引擎</div>
-                        <Select value={smartSegEngine} onValueChange={(v) => setSmartSegEngine(v)}>
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="auto">自动（推荐）</SelectItem>
-                            <SelectItem value="fastsam_tensorrt">FastSAM TensorRT（更快）</SelectItem>
-                            <SelectItem value="sam">SAM（更精细）</SelectItem>
-                            <SelectItem value="flood">传统（容差分割）</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
                       <div className="space-y-1">
                         <div className="text-xs text-muted-foreground">范围</div>
                         <Select value={smartDetectScope} onValueChange={(v) => setSmartDetectScope(v as "image" | "dataset")}>
@@ -2049,55 +2081,55 @@ export default function AnnotationStudio() {
                       </div>
                       <div className="space-y-1">
                         <div className="text-xs text-muted-foreground">阈值（0-1）</div>
-                        <Input
-                          type="number"
-                          step="0.01"
-                          min="0"
-                          max="1"
-                          value={smartDetectThreshold}
-                          onChange={(e) => setSmartDetectThreshold(Number(e.target.value))}
-                        />
+                        <Input type="number" step="0.01" min="0" max="1" value={smartDetectThreshold} onChange={(e) => setSmartDetectThreshold(Number(e.target.value))} />
                       </div>
                       <div className="space-y-1">
                         <div className="text-xs text-muted-foreground">最多图片数（可选）</div>
-                        <Input
-                          type="number"
-                          min="1"
-                          placeholder="留空=全部"
-                          value={smartDetectMaxImages}
-                          onChange={(e) => setSmartDetectMaxImages(e.target.value)}
-                        />
+                        <Input type="number" min="1" placeholder="留空=全部" value={smartDetectMaxImages} onChange={(e) => setSmartDetectMaxImages(e.target.value)} />
                       </div>
                       <div className="space-y-1">
                         <div className="text-xs text-muted-foreground">单图最多目标</div>
-                        <Input
-                          type="number"
-                          min="1"
-                          max="500"
-                          value={smartDetectMaxDet}
-                          onChange={(e) => setSmartDetectMaxDet(Number(e.target.value))}
-                        />
+                        <Input type="number" min="1" max="500" value={smartDetectMaxDet} onChange={(e) => setSmartDetectMaxDet(Number(e.target.value))} />
                       </div>
                       <div className="space-y-1">
                         <div className="text-xs text-muted-foreground">最小间隔（可选）</div>
-                        <Input
-                          type="number"
-                          min="1"
-                          placeholder="留空=自动"
-                          value={smartDetectMinDistance}
-                          onChange={(e) => setSmartDetectMinDistance(e.target.value)}
-                        />
+                        <Input type="number" min="1" placeholder="留空=自动" value={smartDetectMinDistance} onChange={(e) => setSmartDetectMinDistance(e.target.value)} />
                       </div>
                       <div className="space-y-1">
                         <div className="text-xs text-muted-foreground">去重 IoU（0-1）</div>
-                        <Input
-                          type="number"
-                          step="0.01"
-                          min="0"
-                          max="1"
-                          value={smartDetectDedupIou}
-                          onChange={(e) => setSmartDetectDedupIou(Number(e.target.value))}
-                        />
+                        <Input type="number" step="0.01" min="0" max="1" value={smartDetectDedupIou} onChange={(e) => setSmartDetectDedupIou(Number(e.target.value))} />
+                      </div>
+                    </div>
+
+                    <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-input"
+                        checked={smartDetectOnlyUnannotated}
+                        onChange={(e) => setSmartDetectOnlyUnannotated(e.target.checked)}
+                      />
+                      仅处理未标注图片（推荐）
+                    </label>
+
+                    <div className="rounded-md border p-3 space-y-2">
+                      <div className="text-sm font-medium">模型自动标注（单图）</div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div className="space-y-1">
+                          <div className="text-xs text-muted-foreground">置信度 conf（0-1）</div>
+                          <Input type="number" step="0.01" min="0" max="1" value={autoLabelConf} onChange={(e) => setAutoLabelConf(Number(e.target.value))} />
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs text-muted-foreground">NMS IoU（0-1）</div>
+                          <Input type="number" step="0.01" min="0" max="1" value={autoLabelIou} onChange={(e) => setAutoLabelIou(Number(e.target.value))} />
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs text-muted-foreground">max_det</div>
+                          <Input type="number" min="1" max="1000" value={autoLabelMaxDet} onChange={(e) => setAutoLabelMaxDet(Number(e.target.value))} />
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs text-muted-foreground">新增去重 IoU（0-1）</div>
+                          <Input type="number" step="0.01" min="0" max="1" value={autoLabelDedupIou} onChange={(e) => setAutoLabelDedupIou(Number(e.target.value))} />
+                        </div>
                       </div>
                     </div>
 
@@ -2106,7 +2138,7 @@ export default function AnnotationStudio() {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
-                      <Button size="sm" onClick={enterSmartDetectMode} disabled={smartBusy || !currentImageId}>
+                      <Button size="sm" onClick={enterSmartDetectMode} disabled={smartBusy || !currentImageId || classes.length === 0}>
                         进入框选模式
                       </Button>
                       <Button
@@ -2116,7 +2148,7 @@ export default function AnnotationStudio() {
                           setIsSmartPanelOpen(false);
                           void handleAIAutoLabel();
                         }}
-                        disabled={smartBusy || !currentImageId}
+                        disabled={smartBusy || !currentImageId || classes.length === 0}
                       >
                         使用训练模型自动标注（单图）
                       </Button>
@@ -2125,16 +2157,24 @@ export default function AnnotationStudio() {
                 ) : (
                   <div className="space-y-3">
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="space-y-1 md:col-span-2">
+                        <div className="text-xs text-muted-foreground">分割引擎</div>
+                        <Select value={smartSegEngine} onValueChange={(v) => setSmartSegEngine(v)}>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="auto">自动（推荐）</SelectItem>
+                            <SelectItem value="fastsam_tensorrt">FastSAM TensorRT（更快）</SelectItem>
+                            <SelectItem value="fastsam">FastSAM（通用）</SelectItem>
+                            <SelectItem value="sam">SAM（边界更细）</SelectItem>
+                            <SelectItem value="flood">传统 flood（兜底）</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
                       <div className="space-y-1">
                         <div className="text-xs text-muted-foreground">容差（0-1）</div>
-                        <Input
-                          type="number"
-                          step="0.01"
-                          min="0"
-                          max="1"
-                          value={smartSegTolerance}
-                          onChange={(e) => setSmartSegTolerance(Number(e.target.value))}
-                        />
+                        <Input type="number" step="0.01" min="0" max="1" value={smartSegTolerance} onChange={(e) => setSmartSegTolerance(Number(e.target.value))} />
                       </div>
                       <div className="space-y-1">
                         <div className="text-xs text-muted-foreground">简化程度</div>
@@ -2142,10 +2182,10 @@ export default function AnnotationStudio() {
                       </div>
                     </div>
 
-                    <div className="text-xs text-muted-foreground">提示：进入模式后，在目标上点击一个点（每次点击只标注一个）。</div>
+                    <div className="text-xs text-muted-foreground">提示：进入模式后，在目标上点击一个点（每次点击标注一个实例）。</div>
 
                     <div className="flex flex-wrap items-center gap-2">
-                      <Button size="sm" onClick={enterSmartSegmentMode} disabled={smartBusy || !currentImageId}>
+                      <Button size="sm" onClick={enterSmartSegmentMode} disabled={smartBusy || !currentImageId || classes.length === 0}>
                         进入点选模式
                       </Button>
                     </div>
@@ -2162,7 +2202,7 @@ export default function AnnotationStudio() {
             <Wand2 className="w-4 h-4 text-purple-500" />
             <div className="text-sm">
               {smartMode === "detect" ? "智能检测：拖拽框选参考目标" : "智能分割：点击目标上的点"}
-              {smartBusy ? <span className="ml-2 text-muted-foreground">处理中…</span> : null}
+              {smartBusy ? <span className="ml-2 text-muted-foreground">处理中...</span> : null}
             </div>
             <Button size="sm" variant="outline" onClick={cancelSmartMode} disabled={smartBusy}>
               退出

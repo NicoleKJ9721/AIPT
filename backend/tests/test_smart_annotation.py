@@ -114,6 +114,87 @@ def test_smart_detect_creates_rects(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             assert len(rects) == 1
 
 
+def test_smart_detect_only_unannotated_skips_images(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AIPT_STORAGE_DIR", str(tmp_path / "storage_env"))
+    monkeypatch.setenv("AIPT_API_KEY", "test-key")
+
+    project_root = tmp_path / "storage_project"
+
+    rng = np.random.default_rng(42)
+    patch = rng.integers(0, 255, size=(10, 10), dtype=np.uint8)
+    placements = [(8, 8), (24, 24)]
+    images: list[tuple[str, bytes]] = []
+    for idx, (x, y) in enumerate(placements, start=1):
+        arr = np.full((64, 64), 32, dtype=np.uint8)
+        arr[y : y + patch.shape[0], x : x + patch.shape[1]] = patch
+        images.append((f"img{idx}.png", _png_bytes(arr)))
+
+    with TestClient(app) as client:
+        project_id, dataset_id = _create_project_and_dataset(client, project_root)
+
+        resp = client.post(
+            f"/datasets/{dataset_id}/files",
+            headers=_api_headers(api_key="test-key"),
+            files=[("files", (name, data, "image/png")) for name, data in images],
+        )
+        assert resp.status_code == 201, resp.text
+
+        resp = client.get(f"/projects/{project_id}/images", params={"dataset_id": dataset_id}, headers=_api_headers())
+        assert resp.status_code == 200, resp.text
+        project_images = resp.json()
+        assert len(project_images) == 2
+        ref_img = project_images[0]
+        pre_annotated = project_images[1]
+
+        # Seed one image with an existing annotation so it should be skipped.
+        resp = client.put(
+            f"/images/{pre_annotated['id']}/annotations",
+            json=[
+                {
+                    "type": "rect",
+                    "label": "seed",
+                    "color": "#ef4444",
+                    "visible": True,
+                    "x": 2,
+                    "y": 2,
+                    "width": 8,
+                    "height": 8,
+                }
+            ],
+        )
+        assert resp.status_code == 200, resp.text
+
+        x0, y0 = placements[0]
+        box = [float(x0), float(y0), float(x0 + patch.shape[1]), float(y0 + patch.shape[0])]
+        resp = client.post(
+            "/smart-annotation/detect",
+            headers=_api_headers(),
+            json={
+                "dataset_id": dataset_id,
+                "reference_image_id": ref_img["id"],
+                "label": "obj",
+                "color": "#22c55e",
+                "box": box,
+                "scope": "dataset",
+                "max_images": 2,
+                "threshold": 0.9,
+                "max_det_per_image": 1,
+                "min_distance": 5,
+                "dedup_iou": 0.9,
+                "only_unannotated": True,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()["data"]
+        assert payload["processed_images"] == 2
+        assert payload["created_annotations"] == 1
+        assert payload["skipped_images"] == 1
+        skipped = [item for item in payload["images"] if item.get("skipped")]
+        assert len(skipped) == 1
+        assert skipped[0]["image_id"] == pre_annotated["id"]
+        assert skipped[0]["reason"] == "has_annotations"
+
+
 def test_smart_segment_returns_polygon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("AIPT_STORAGE_DIR", str(tmp_path / "storage_env"))
     monkeypatch.setenv("AIPT_API_KEY", "test-key")

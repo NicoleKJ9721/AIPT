@@ -182,3 +182,12 @@ def test_train_dataset_id_exports_yolo_dataset(tmp_path: Path, monkeypatch: pyte
     content = data_yaml.read_text(encoding="utf-8")
     assert "train:" in content
     assert "names:" in content
+
+
+def test_train_incremental_requires_base_model_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AIPT_HOME_DIR", str(tmp_path / "aipt_home"))
+
+    with TestClient(app) as client:
+        resp = client.post("/train", json={"data": "coco128.yaml", "epochs": 1, "mode": "incremental", "project_id": "p"})
+        assert resp.status_code == 400, resp.text
+        assert "base_model_id" in (resp.json().get("message") or "")

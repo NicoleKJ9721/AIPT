@@ -98,6 +98,9 @@ def _migrate_sqlite(engine: Engine) -> None:
     ensure_column("images", "dataset_id", "dataset_id VARCHAR")
     ensure_column("images", "dataset_file_id", "dataset_file_id VARCHAR")
     ensure_column("projects", "storage_root", "storage_root VARCHAR")
+    ensure_column("trained_models", "parent_model_id", "parent_model_id VARCHAR")
+    ensure_column("trained_models", "train_mode", "train_mode VARCHAR NOT NULL DEFAULT 'transfer'")
+    ensure_column("trained_models", "train_config", "train_config JSON")
 
 
 def init_db() -> None:
@@ -107,6 +110,7 @@ def init_db() -> None:
         DatasetFile,
         Image,
         LabelClass,
+        Pipeline,
         Project,
         TrainedModel,
     )

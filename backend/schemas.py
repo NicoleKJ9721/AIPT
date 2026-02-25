@@ -241,8 +241,11 @@ class TrainedModelOut(BaseModel):
     id: str
     project_id: str
     dataset_id: str | None = None
+    parent_model_id: str | None = None
     name: str
     base_model: str
+    train_mode: str = "transfer"
+    train_config: dict | None = None
     metrics: dict | None = None
     created_at: dt.datetime
 
@@ -293,3 +296,86 @@ class HardwareDeviceOut(BaseModel):
     cores: int | None = None
     compute_capability: str | None = None
     status: str = "Available"
+
+
+PipelineConnectorSource = Literal["prev_detections", "prev_segments"]
+PipelineConnectorOnEmpty = Literal["stop", "fallback_full", "skip"]
+
+
+class PipelineConnectorSpec(BaseModel):
+    source: PipelineConnectorSource = "prev_detections"
+    min_conf: float = Field(default=0.0, ge=0.0, le=1.0)
+    classes: list[int | str] | None = None
+    padding: float = Field(default=0.0, ge=0.0, le=1.0)
+    max_regions: int | None = Field(default=None, ge=1, le=200)
+    on_empty: PipelineConnectorOnEmpty = "stop"
+
+
+class PipelineStepSpec(BaseModel):
+    id: str = Field(min_length=1, max_length=120)
+    title: str = Field(min_length=1, max_length=200)
+    model_id: str = Field(min_length=1, max_length=120)
+
+    conf: float = Field(default=0.25, ge=0.0, le=1.0)
+    iou: float = Field(default=0.7, ge=0.0, le=1.0)
+    max_det: int = Field(default=50, ge=1, le=300)
+
+    # Optional class filters. Supports int IDs and/or string names (resolved by the model's names mapping).
+    classes: list[int | str] | None = None
+
+    # Preferred connector config (new).
+    connector: PipelineConnectorSpec | None = None
+
+    # If enabled, the *next* step will run on cropped regions from this step's detections.
+    # Kept for backward compatibility with existing saved pipelines.
+    crop: bool = False
+    crop_padding: float = Field(default=0.0, ge=0.0, le=1.0)
+    crop_max_regions: int | None = Field(default=None, ge=1, le=200)
+
+
+class PipelineCreate(BaseModel):
+    project_id: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=2000)
+    steps: list[PipelineStepSpec] = Field(min_length=1)
+
+
+class PipelineUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    steps: list[PipelineStepSpec] | None = None
+
+
+class PipelineOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: str
+    name: str
+    description: str
+    steps: list[PipelineStepSpec] | None = None
+    created_at: dt.datetime
+    updated_at: dt.datetime
+
+
+class PipelineRunRequest(BaseModel):
+    project_id: str = Field(min_length=1, max_length=120)
+    steps: list[PipelineStepSpec] = Field(min_length=1)
+
+
+class PipelineRunStepOut(BaseModel):
+    step_id: str
+    title: str
+    model_id: str
+    detections: list[ModelEvaluationDetectionOut] = Field(default_factory=list)
+    duration_ms: int | None = None
+    note: str | None = None
+
+
+class PipelineRunOut(BaseModel):
+    project_id: str
+    pipeline_id: str | None = None
+    steps: list[PipelineRunStepOut] = Field(default_factory=list)
+    final_detections: list[ModelEvaluationDetectionOut] = Field(default_factory=list)
+    merged_detections: list[ModelEvaluationDetectionOut] = Field(default_factory=list)
+    note: str | None = None

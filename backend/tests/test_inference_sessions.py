@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -78,7 +78,7 @@ def test_inference_session_is_cached_and_predict_reuses_model(tmp_path: Path, mo
     with TestClient(app) as client:
         resp = client.post(
             "/projects",
-            json={"name": "Infer Project", "type": "目标检测", "storage_root": str(project_storage_root)},
+            json={"name": "Infer Project", "type": "detection", "storage_root": str(project_storage_root)},
         )
         assert resp.status_code == 201, resp.text
         project_id = resp.json()["id"]
@@ -97,8 +97,8 @@ def test_inference_session_is_cached_and_predict_reuses_model(tmp_path: Path, mo
                 id=model_id,
                 project_id=project_id,
                 dataset_id=None,
-                name="yolov8m-test",
-                base_model="yolov8m",
+                name="yolo26m-test",
+                base_model="yolo26m",
                 weights_path=f"projects/{project_id}/models/{model_id}/best.pt",
                 results_path=None,
                 metrics=None,
@@ -108,7 +108,7 @@ def test_inference_session_is_cached_and_predict_reuses_model(tmp_path: Path, mo
         finally:
             db.close()
 
-        payload = {"project_id": project_id, "model_id": model_id, "format": "tensorrt", "device": "0"}
+        payload = {"project_id": project_id, "model_id": model_id, "format": "tensorrt", "device": "0", "end2end": True}
 
         resp = client.post("/inference/sessions", json=payload)
         assert resp.status_code in (200, 201), resp.text
@@ -139,5 +139,130 @@ def test_inference_session_is_cached_and_predict_reuses_model(tmp_path: Path, mo
         assert len(init_calls) == 2
         assert len(predict_calls) >= 1
 
-        resp4 = client.delete(f"/inference/sessions/{session_id}")
-        assert resp4.status_code == 200, resp4.text
+        # Different end2end mode should not reuse the cached session.
+        payload2 = {**payload, "end2end": False}
+
+        resp4 = client.post("/inference/sessions", json=payload2)
+        assert resp4.status_code in (200, 201), resp4.text
+        session_id2 = resp4.json()["data"]["id"]
+        assert session_id2
+        assert session_id2 != session_id
+        assert len(init_calls) == 4  # 2 more inits for the other end2end export + load
+
+        resp5 = client.post("/inference/sessions", json=payload2)
+        assert resp5.status_code == 200, resp5.text
+        assert resp5.json()["data"]["id"] == session_id2
+        assert len(init_calls) == 4
+
+        resp6 = client.delete(f"/inference/sessions/{session_id}")
+        assert resp6.status_code == 200, resp6.text
+        resp7 = client.delete(f"/inference/sessions/{session_id2}")
+        assert resp7.status_code == 200, resp7.text
+
+
+def test_inference_session_defaults_end2end_false(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AIPT_HOME_DIR", str(tmp_path / "aipt_home"))
+    monkeypatch.setenv("AIPT_API_KEY", "test-key")
+
+    predict_kwargs_seen: list[dict] = []
+
+    class DummyScalar:
+        def __init__(self, value: float):
+            self._value = float(value)
+
+        def item(self):
+            return self._value
+
+    class DummyArray(list):
+        def tolist(self):
+            return list(self)
+
+    class DummyBox:
+        def __init__(self):
+            self.xyxy = [DummyArray([1.0, 2.0, 10.0, 20.0])]
+            self.conf = [DummyScalar(0.9)]
+            self.cls = [DummyScalar(0.0)]
+
+    class DummyResult:
+        def __init__(self):
+            self.boxes = [DummyBox()]
+            self.names = {0: "ok"}
+
+    class DummyYOLO:
+        def __init__(self, weights: str):
+            self.weights = weights
+
+        def export(self, format: str = "engine", save_dir: str | None = None, project: str | None = None, name: str | None = None, **_):
+            base = Path(save_dir or project or Path(self.weights).parent).resolve()
+            out_dir = base / (name or "export")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if format == "engine":
+                p = (out_dir / "model.engine").resolve()
+                p.write_bytes(b"dummy-engine")
+                return str(p)
+            raise ValueError("unsupported format")
+
+        def predict(self, _source: str, **kwargs):
+            predict_kwargs_seen.append(dict(kwargs))
+            return [DummyResult()]
+
+    dummy_mod = ModuleType("ultralytics")
+    dummy_mod.YOLO = DummyYOLO  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ultralytics", dummy_mod)
+
+    project_storage_root = tmp_path / "project_storage"
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/projects",
+            json={"name": "Infer Project", "type": "detection", "storage_root": str(project_storage_root)},
+        )
+        assert resp.status_code == 201, resp.text
+        project_id = resp.json()["id"]
+
+        model_id = uuid4().hex
+        model_dir = project_storage_root / "projects" / project_id / "models" / model_id
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "best.pt").write_bytes(b"dummy-weights")
+
+        from db import SessionLocal  # noqa: E402
+        from db_models import TrainedModel  # noqa: E402
+
+        db = SessionLocal()
+        try:
+            rec = TrainedModel(
+                id=model_id,
+                project_id=project_id,
+                dataset_id=None,
+                name="yolo26m-test-default",
+                base_model="yolo26m",
+                weights_path=f"projects/{project_id}/models/{model_id}/best.pt",
+                results_path=None,
+                metrics=None,
+            )
+            db.add(rec)
+            db.commit()
+        finally:
+            db.close()
+
+        payload = {"project_id": project_id, "model_id": model_id, "format": "tensorrt", "device": "0"}
+        resp = client.post("/inference/sessions", json=payload)
+        assert resp.status_code in (200, 201), resp.text
+        data = resp.json()["data"]
+        assert data["end2end"] is False
+        session_id = data["id"]
+
+        img = tmp_path / "test.jpg"
+        Image.new("RGB", (8, 8), color="white").save(img, format="JPEG")
+        with img.open("rb") as f:
+            pred = client.post(
+                f"/inference/sessions/{session_id}/predict",
+                files={"file": ("test.jpg", f, "image/jpeg")},
+            )
+        assert pred.status_code == 200, pred.text
+        assert predict_kwargs_seen, "predict() was not called"
+        assert predict_kwargs_seen[-1].get("end2end") is False
+
+        closed = client.delete(f"/inference/sessions/{session_id}")
+        assert closed.status_code == 200, closed.text
+

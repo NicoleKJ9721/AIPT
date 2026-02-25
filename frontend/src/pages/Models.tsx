@@ -1,4 +1,4 @@
-import { ArrowRight, Box, CloudLightning, Cpu, HardDrive, LineChart, Play, RefreshCw, Square, Trash2 } from "lucide-react";
+import { ArrowRight, Box, CloudLightning, Cpu, GitBranch, HardDrive, LineChart, Play, RefreshCw, Square, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { isAxiosError } from "axios";
@@ -48,6 +48,7 @@ type EvalParams = {
   device: string;
   half: boolean;
   augment: boolean;
+  end2end: boolean;
   classes: string;
 };
 
@@ -61,15 +62,16 @@ const DEFAULT_EVAL_PARAMS: EvalParams = {
   device: "",
   half: false,
   augment: false,
+  end2end: false,
   classes: "",
 };
 
-const YOLOV8_MODELS = [
-  { value: "yolov8n", label: "YOLOv8n (Nano)" },
-  { value: "yolov8s", label: "YOLOv8s (Small)" },
-  { value: "yolov8m", label: "YOLOv8m (Medium)" },
-  { value: "yolov8l", label: "YOLOv8l (Large)" },
-  { value: "yolov8x", label: "YOLOv8x (X-Large)" },
+const YOLO_MODELS = [
+  { value: "yolo26n", label: "YOLO26n (Nano)" },
+  { value: "yolo26s", label: "YOLO26s (Small)" },
+  { value: "yolo26m", label: "YOLO26m (Medium)" },
+  { value: "yolo26l", label: "YOLO26l (Large)" },
+  { value: "yolo26x", label: "YOLO26x (X-Large)" },
 ] as const;
 
 function clamp(value: number, min: number, max: number) {
@@ -330,7 +332,10 @@ export default function Models() {
     batch: 16,
     imgsz: 640,
     lr0: 0.01,
-    model: "yolov8m",
+    model: "yolo26m",
+    mode: "transfer",
+    output_name: "",
+    base_model_id: null,
   });
   const [isTraining, setIsTraining] = useState(false);
   const [isStoppingTraining, setIsStoppingTraining] = useState(false);
@@ -432,6 +437,13 @@ export default function Models() {
     }
     return { locked, reason, jobId, status, kind };
   }, [activeTrainHint, inferenceLock.locked, inferenceLock.reason, trainJob, trainJobId]);
+
+  const incrementalTrainBlockedReason = useMemo(() => {
+    if ((trainConfig.mode ?? "transfer") !== "incremental") return "";
+    if (trainedModels.length === 0) return "增量训练需要先生成历史模型版本";
+    if (!String(trainConfig.base_model_id || "").trim()) return "请选择基础模型";
+    return "";
+  }, [trainConfig.base_model_id, trainConfig.mode, trainedModels.length]);
 
   const monitoringCharts = useMemo(() => {
     const series = trainMetrics?.series || {};
@@ -650,6 +662,14 @@ export default function Models() {
     }
   }, [loadTrainedModels, trainJob?.status]);
 
+  useEffect(() => {
+    if ((trainConfig.mode ?? "transfer") !== "incremental") return;
+    const current = (trainConfig.base_model_id || "").trim();
+    if (current) return;
+    if (trainedModels.length === 0) return;
+    setTrainConfig((prev) => ({ ...prev, base_model_id: trainedModels[0].id }));
+  }, [trainConfig.base_model_id, trainConfig.mode, trainedModels]);
+
   const handleTrain = async () => {
     if (trainLock.locked) {
       const byInference = trainLock.kind === "inference" || trainLock.kind === "both";
@@ -684,12 +704,36 @@ export default function Models() {
 
     try {
       setIsTraining(true);
+      const mode = (trainConfig.mode ?? "transfer") as "transfer" | "incremental";
+      const baseModelId = (trainConfig.base_model_id || "").trim();
+      if (mode === "incremental" && trainedModels.length === 0) {
+        toast({ title: "暂无可用历史模型", description: "请先完成一次迁移训练生成模型版本", variant: "destructive" });
+        return;
+      }
+      if (mode === "incremental" && !baseModelId) {
+        toast({ title: "请选择基础模型", description: "增量训练需要从历史模型继续训练", variant: "destructive" });
+        return;
+      }
+
+      const device = (() => {
+        const id = (primaryDeviceId || "").trim();
+        if (id.startsWith("gpu-")) return id.slice(4);
+        if (id.startsWith("cpu")) return "cpu";
+        return undefined;
+      })();
+
       const payload: TrainConfig = {
-        ...trainConfig,
-        model: trainConfig.model || "yolov8m",
+        data: `dataset:${activeDatasetId}`,
+        epochs: trainConfig.epochs,
+        batch: trainConfig.batch,
+        imgsz: trainConfig.imgsz,
+        lr0: trainConfig.lr0,
+        mode,
+        output_name: (trainConfig.output_name || "").trim() || null,
         project_id: activeProjectId,
         dataset_id: activeDatasetId,
-        data: `dataset:${activeDatasetId}`,
+        device: device ?? null,
+        ...(mode === "transfer" ? { model: trainConfig.model || "yolo26m" } : { base_model_id: baseModelId }),
       };
       const response = await aiService.train(payload);
       toast({ title: "训练已启动", description: response.message });
@@ -838,6 +882,7 @@ export default function Models() {
           device: evalParams.device || undefined,
           half: evalParams.half,
           augment: evalParams.augment,
+          end2end: evalParams.end2end,
           classes: evalParams.classes || undefined,
         });
         if (cancelled) return;
@@ -1066,6 +1111,18 @@ export default function Models() {
                   />
                 </div>
 
+                <div className="space-y-1">
+                  <div className="text-[11px] text-muted-foreground">head</div>
+                  <select
+                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                    value={evalDraft.end2end ? "end2end" : "precise"}
+                    onChange={(e) => setEvalDraft((p) => ({ ...p, end2end: e.target.value === "end2end" }))}
+                  >
+                    <option value="end2end">端到端（更快）</option>
+                    <option value="precise">高精度（end2end=false）</option>
+                  </select>
+                </div>
+
                 <label className="flex items-center gap-2 text-xs text-muted-foreground select-none">
                   <input
                     type="checkbox"
@@ -1258,8 +1315,8 @@ export default function Models() {
           <Button
             className="gap-2"
             onClick={handleTrain}
-            disabled={isTraining || trainLock.locked}
-            title={trainLock.locked ? trainLock.reason : undefined}
+            disabled={isTraining || trainLock.locked || !!incrementalTrainBlockedReason}
+            title={trainLock.locked ? trainLock.reason : incrementalTrainBlockedReason || undefined}
           >
             {isTraining ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
           {isTraining ? "启动中..." : "开始训练"}
@@ -1535,12 +1592,12 @@ export default function Models() {
           </CardContent>
         </Card>
 
-        <Card>
+        <Card id="train-params">
           <CardHeader>
             <div className="flex items-center justify-between gap-4">
               <div>
                 <CardTitle>训练参数</CardTitle>
-                <CardDescription>仅保留 YOLOv8 系列；默认 YOLOv8m；推荐参数基于硬件与数据集规模</CardDescription>
+                <CardDescription>默认 YOLO26m；推荐参数基于硬件与数据集规模</CardDescription>
               </div>
               <Button
                 variant="outline"
@@ -1562,20 +1619,95 @@ export default function Models() {
           </CardHeader>
           <CardContent>
             <form className="space-y-4">
-              <div className="space-y-2">
-                <label className="text-sm font-medium">模型</label>
-                <select
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                  value={trainConfig.model ?? "yolov8m"}
-                  onChange={(e) => setTrainConfig({ ...trainConfig, model: e.target.value })}
-                >
-                  {YOLOV8_MODELS.map((m) => (
-                    <option key={m.value} value={m.value}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">训练类型</label>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant={(trainConfig.mode ?? "transfer") === "transfer" ? "default" : "outline"}
+                      onClick={() =>
+                        setTrainConfig((prev) => ({
+                          ...prev,
+                          mode: "transfer",
+                          base_model_id: null,
+                        }))
+                      }
+                    >
+                      迁移训练
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={(trainConfig.mode ?? "transfer") === "incremental" ? "default" : "outline"}
+                      onClick={() =>
+                        setTrainConfig((prev) => ({
+                          ...prev,
+                          mode: "incremental",
+                          base_model_id: prev.base_model_id ?? (trainedModels[0]?.id ?? null),
+                        }))
+                      }
+                    >
+                      增量训练
+                    </Button>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    迁移训练：从 YOLO26 预训练开始；增量训练：从历史项目模型继续训练（生成新版本）。
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">输出模型名称（可选）</label>
+                  <Input
+                    value={trainConfig.output_name ?? ""}
+                    onChange={(e) => setTrainConfig((prev) => ({ ...prev, output_name: e.target.value }))}
+                    placeholder="留空则自动命名"
+                  />
+                  <div className="text-xs text-muted-foreground">留空将自动命名，不会覆盖旧版本。</div>
+                </div>
               </div>
+
+              {(trainConfig.mode ?? "transfer") === "transfer" ? (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">预训练模型（YOLO26）</label>
+                  <select
+                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                    value={trainConfig.model ?? "yolo26m"}
+                    onChange={(e) => setTrainConfig({ ...trainConfig, model: e.target.value })}
+                  >
+                    {YOLO_MODELS.map((m) => (
+                      <option key={m.value} value={m.value}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">基础模型（版本历史）</label>
+                  <select
+                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                    value={trainConfig.base_model_id ?? ""}
+                    onChange={(e) => setTrainConfig({ ...trainConfig, base_model_id: e.target.value || null })}
+                    disabled={trainedModels.length === 0}
+                  >
+                    <option value="">
+                      {trainedModels.length === 0 ? "暂无历史模型（请先完成一次迁移训练）" : "请选择基础模型"}
+                    </option>
+                    {trainedModels.map((m) => {
+                      const dt = new Date(m.created_at);
+                      const created = Number.isFinite(dt.getTime()) ? dt.toLocaleString() : m.created_at;
+                      return (
+                        <option key={m.id} value={m.id}>
+                          {m.name} · {m.base_model} · {created}
+                        </option>
+                      );
+                    })}
+                  </select>
+                  <div className="text-xs text-muted-foreground">
+                    增量训练将从所选模型继续训练，不提供 YOLO26 预训练选择。
+                  </div>
+                </div>
+              )}
 
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
@@ -1629,7 +1761,7 @@ export default function Models() {
       <Card>
         <CardHeader>
           <CardTitle>训练过程与模型性能评估</CardTitle>
-          <CardDescription>YOLOv8 官方 results.csv 指标全局曲线（无训练时也展示坐标轴）</CardDescription>
+          <CardDescription>Ultralytics results.csv 指标全局曲线（无训练时也展示坐标轴）</CardDescription>
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
@@ -1701,6 +1833,22 @@ export default function Models() {
                       <TableCell className="text-muted-foreground">{createdText}</TableCell>
                       <TableCell className="text-right">
                         <div className="flex items-center justify-end gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="gap-2"
+                            onClick={() => {
+                              setTrainConfig((prev) => ({
+                                ...prev,
+                                mode: "incremental",
+                                base_model_id: m.id,
+                                output_name: `${m.name}-inc`,
+                              }));
+                              document.getElementById("train-params")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                            }}
+                          >
+                            <GitBranch className="w-3 h-3" /> 增量训练
+                          </Button>
                           <Button size="sm" variant="outline" className="gap-2" onClick={() => openEvaluation(m)}>
                             <LineChart className="w-3 h-3" /> 性能评估
                           </Button>

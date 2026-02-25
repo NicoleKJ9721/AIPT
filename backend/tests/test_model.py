@@ -1,5 +1,6 @@
 import os
 import sys
+from types import ModuleType
 
 import numpy as np
 from PIL import Image
@@ -38,7 +39,9 @@ class _DummyYOLO:
 
 
 def test_object_detector_predict_and_train(monkeypatch):
-    monkeypatch.setattr(model, "YOLO", _DummyYOLO)
+    dummy_mod = ModuleType("ultralytics")
+    dummy_mod.YOLO = _DummyYOLO  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ultralytics", dummy_mod)
 
     det = model.ObjectDetector("dummy.pt")
     img = Image.new("RGB", (32, 32), color="white")

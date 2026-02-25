@@ -32,6 +32,9 @@ def test_models_list_delete_and_export_pt(tmp_path: Path, monkeypatch: pytest.Mo
         model_dir = project_storage_root / "projects" / project_id / "models" / model_id
         model_dir.mkdir(parents=True, exist_ok=True)
         (model_dir / "best.pt").write_bytes(b"dummy-weights")
+        model_cache_dir = (tmp_path / "aipt_home" / "resources" / "deploy_cache" / project_id / model_id / "tensorrt" / "end2end_0").resolve()
+        model_cache_dir.mkdir(parents=True, exist_ok=True)
+        (model_cache_dir / "model.engine").write_bytes(b"engine")
 
         from db import SessionLocal  # noqa: E402
         from db_models import TrainedModel  # noqa: E402
@@ -42,8 +45,8 @@ def test_models_list_delete_and_export_pt(tmp_path: Path, monkeypatch: pytest.Mo
                 id=model_id,
                 project_id=project_id,
                 dataset_id=None,
-                name="yolov8m-test",
-                base_model="yolov8m",
+                name="yolo26m-test",
+                base_model="yolo26m",
                 weights_path=f"projects/{project_id}/models/{model_id}/best.pt",
                 results_path=None,
                 metrics={"map50": 0.1234, "map": 0.0567},
@@ -67,6 +70,7 @@ def test_models_list_delete_and_export_pt(tmp_path: Path, monkeypatch: pytest.Mo
         resp = client.delete(f"/models/{model_id}", headers={"X-API-Key": "test-key"})
         assert resp.status_code == 200, resp.text
         assert not model_dir.exists()
+        assert not (tmp_path / "aipt_home" / "resources" / "deploy_cache" / project_id / model_id).exists()
 
 
 def test_models_export_onnx_with_stub_ultralytics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -130,8 +134,8 @@ def test_models_export_onnx_with_stub_ultralytics(tmp_path: Path, monkeypatch: p
                     id=model_id,
                     project_id=project_id,
                     dataset_id=None,
-                    name="yolov8m-export",
-                    base_model="yolov8m",
+                    name="yolo26m-export",
+                    base_model="yolo26m",
                     weights_path=f"projects/{project_id}/models/{model_id}/best.pt",
                     results_path=None,
                     metrics=None,
@@ -191,8 +195,8 @@ def test_models_export_openvino_zips_directory(tmp_path: Path, monkeypatch: pyte
                     id=model_id,
                     project_id=project_id,
                     dataset_id=None,
-                    name="yolov8m-export-ov",
-                    base_model="yolov8m",
+                    name="yolo26m-export-ov",
+                    base_model="yolo26m",
                     weights_path=f"projects/{project_id}/models/{model_id}/best.pt",
                     results_path=None,
                     metrics=None,

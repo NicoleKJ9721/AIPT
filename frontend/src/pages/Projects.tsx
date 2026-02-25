@@ -232,7 +232,7 @@ export default function Projects() {
         project: project,
         configurations: {
             // Mock config data
-            model: "YOLOv8",
+            model: "YOLO26",
             batchSize: 16,
             learningRate: 0.001
         }

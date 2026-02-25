@@ -34,6 +34,14 @@ export interface DetectionResult {
   }[];
 }
 
+export interface PredictOptions {
+  conf?: number;
+  iou?: number;
+  max_det?: number;
+  imgsz?: number;
+  classes?: number[];
+}
+
 export interface TrainConfig {
   data: string;
   epochs: number;
@@ -41,6 +49,13 @@ export interface TrainConfig {
   batch: number;
   lr0?: number;
   model?: string;
+  mode?: "transfer" | "incremental";
+  output_name?: string | null;
+  base_model_id?: string | null;
+  device?: string | null;
+  amp?: boolean | null;
+  workers?: number | null;
+  cache?: boolean | "ram" | null;
   project_id?: string;
   dataset_id?: string;
 }
@@ -60,14 +75,24 @@ export const aiService = {
   },
 
   // Inference
-  predict: async (file: File): Promise<DetectionResult> => {
+  predict: async (file: File, options?: PredictOptions): Promise<DetectionResult> => {
     const formData = new FormData();
     formData.append('file', file);
-    
+    const params: Record<string, string | number> = {};
+    if (typeof options?.conf === "number" && Number.isFinite(options.conf)) params.conf = options.conf;
+    if (typeof options?.iou === "number" && Number.isFinite(options.iou)) params.iou = options.iou;
+    if (typeof options?.max_det === "number" && Number.isFinite(options.max_det)) params.max_det = Math.max(1, Math.floor(options.max_det));
+    if (typeof options?.imgsz === "number" && Number.isFinite(options.imgsz)) params.imgsz = Math.max(32, Math.floor(options.imgsz));
+    if (Array.isArray(options?.classes) && options.classes.length > 0) {
+      const clean = options.classes.map((n) => Number(n)).filter((n) => Number.isFinite(n)).map((n) => Math.floor(n));
+      if (clean.length > 0) params.classes = clean.join(",");
+    }
+
     const response = await api.post<DetectionResult>('/predict', formData, {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
+      params,
     });
     return response.data;
   },
@@ -164,8 +189,11 @@ export interface TrainedModelRecord {
   id: string;
   project_id: string;
   dataset_id?: string | null;
+  parent_model_id?: string | null;
   name: string;
   base_model: string;
+  train_mode?: string;
+  train_config?: Record<string, unknown> | null;
   metrics?: Record<string, unknown> | null;
   created_at: string;
 }
@@ -211,6 +239,7 @@ export const modelService = {
       device?: string;
       half?: boolean;
       augment?: boolean;
+      end2end?: boolean;
       classes?: string;
     }
   ): Promise<ModelEvaluationPageRecord> => {
@@ -229,13 +258,18 @@ export interface ApiResponse<T> {
 }
 
 export type InferenceFormat = "tensorrt" | "openvino";
+export type InferenceKind = "model" | "pipeline";
 
 export interface InferenceSessionRecord {
   id: string;
   project_id: string;
-  model_id: string;
-  format: InferenceFormat;
+  kind: InferenceKind;
+  target_id: string;
+  target_name: string;
+  model_id?: string | null;
+  format?: InferenceFormat | null;
   device?: string | null;
+  end2end?: boolean;
   created_at: string;
   last_used_at?: string | null;
   cached_artifact?: string | null;
@@ -248,11 +282,15 @@ export interface InferenceStatusRecord {
 
 export interface InferenceSessionCreatePayload {
   project_id: string;
-  model_id: string;
-  format?: InferenceFormat;
+  kind?: InferenceKind;
+  target_id?: string;
+  // Backward-compat for older callers.
+  model_id?: string;
+  format?: InferenceFormat | null;
   device?: string | null;
-  half?: boolean;
-  int8?: boolean;
+  end2end?: boolean | null;
+  half?: boolean | null;
+  int8?: boolean | null;
   workspace?: number | null;
   batch?: number | null;
   imgsz?: number | null;
@@ -261,6 +299,8 @@ export interface InferenceSessionCreatePayload {
 export interface InferencePredictionRecord {
   session_id: string;
   detections: ModelEvaluationDetectionRecord[];
+  merged_detections?: ModelEvaluationDetectionRecord[];
+  steps?: PipelineRunStepRecord[] | null;
   note?: string | null;
 }
 
@@ -279,12 +319,116 @@ export const inferenceService = {
   predict: async (
     sessionId: string,
     file: File,
-    params?: { conf?: number; iou?: number; imgsz?: number; max_det?: number; classes?: string }
+    params?: { conf?: number; iou?: number; imgsz?: number; max_det?: number; classes?: string; verbose?: boolean }
   ): Promise<InferencePredictionRecord> => {
     const formData = new FormData();
     formData.append("file", file);
     const response = await api.post<ApiResponse<InferencePredictionRecord>>(`/inference/sessions/${sessionId}/predict`, formData, {
       params,
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+    return response.data.data;
+  },
+};
+
+export interface PipelineConnectorSpecRecord {
+  source?: "prev_detections" | "prev_segments";
+  min_conf?: number;
+  classes?: Array<number | string> | null;
+  padding?: number;
+  max_regions?: number | null;
+  on_empty?: "stop" | "fallback_full" | "skip";
+}
+
+export interface PipelineStepSpecRecord {
+  id: string;
+  title: string;
+  model_id: string;
+  conf?: number;
+  iou?: number;
+  max_det?: number;
+  classes?: Array<number | string> | null;
+  connector?: PipelineConnectorSpecRecord | null;
+  crop?: boolean;
+  crop_padding?: number;
+  crop_max_regions?: number | null;
+}
+
+export interface PipelineRecord {
+  id: string;
+  project_id: string;
+  name: string;
+  description: string;
+  steps?: PipelineStepSpecRecord[] | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PipelineCreatePayload {
+  project_id: string;
+  name: string;
+  description?: string;
+  steps: PipelineStepSpecRecord[];
+}
+
+export interface PipelineUpdatePayload {
+  name?: string;
+  description?: string;
+  steps?: PipelineStepSpecRecord[];
+}
+
+export interface PipelineRunRequestPayload {
+  project_id: string;
+  steps: PipelineStepSpecRecord[];
+}
+
+export interface PipelineRunStepRecord {
+  step_id: string;
+  title: string;
+  model_id: string;
+  detections: ModelEvaluationDetectionRecord[];
+  duration_ms?: number | null;
+  note?: string | null;
+}
+
+export interface PipelineRunResultRecord {
+  project_id: string;
+  pipeline_id?: string | null;
+  steps: PipelineRunStepRecord[];
+  final_detections?: ModelEvaluationDetectionRecord[];
+  merged_detections: ModelEvaluationDetectionRecord[];
+  note?: string | null;
+}
+
+export const pipelineService = {
+  listByProject: async (projectId: string): Promise<PipelineRecord[]> => {
+    const response = await api.get<ApiResponse<PipelineRecord[]>>(`/projects/${projectId}/pipelines`);
+    return response.data.data || [];
+  },
+  create: async (payload: PipelineCreatePayload): Promise<PipelineRecord> => {
+    const response = await api.post<ApiResponse<PipelineRecord>>("/pipelines", payload);
+    return response.data.data;
+  },
+  update: async (pipelineId: string, payload: PipelineUpdatePayload): Promise<PipelineRecord> => {
+    const response = await api.put<ApiResponse<PipelineRecord>>(`/pipelines/${pipelineId}`, payload);
+    return response.data.data;
+  },
+  delete: async (pipelineId: string): Promise<void> => {
+    await api.delete<ApiResponse<null>>(`/pipelines/${pipelineId}`);
+  },
+  runAdhoc: async (payload: PipelineRunRequestPayload, file: File): Promise<PipelineRunResultRecord> => {
+    const formData = new FormData();
+    formData.append("payload", JSON.stringify(payload));
+    formData.append("file", file);
+    const response = await api.post<ApiResponse<PipelineRunResultRecord>>("/pipelines/run", formData, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+    return response.data.data;
+  },
+  runSaved: async (pipelineId: string, file: File): Promise<PipelineRunResultRecord> => {
+    const formData = new FormData();
+    formData.append("file", file);
+    const response = await api.post<ApiResponse<PipelineRunResultRecord>>(`/pipelines/${pipelineId}/run`, formData, {
       headers: { "Content-Type": "multipart/form-data" },
     });
     return response.data.data;
@@ -303,16 +447,20 @@ export interface SmartDetectPayload {
   max_det_per_image?: number;
   min_distance?: number | null;
   dedup_iou?: number;
+  only_unannotated?: boolean;
 }
 
 export interface SmartDetectImageRecord {
   image_id: string;
   created: number;
+  skipped?: boolean;
+  reason?: string | null;
 }
 
 export interface SmartDetectResultRecord {
   processed_images: number;
   created_annotations: number;
+  skipped_images?: number;
   template_size: [number, number];
   images: SmartDetectImageRecord[];
 }
