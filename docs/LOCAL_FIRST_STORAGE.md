@@ -100,12 +100,12 @@ localStorage.setItem("aipt_api_key", "<your-key>");
 
 ## 5. 初始资源（预训练模型）迁移策略
 
-后端启动时会优先从 `<resources_root_dir>/models/yolo26n.pt` 加载 YOLO 权重（若存在）。
+后端启动时会优先从 `<resources_root_dir>/models/yolov8s.pt` 加载 YOLO 权重（若存在）。
 
-若该文件不存在且仓库根目录存在 `yolo26n.pt`：
+若该文件不存在且仓库根目录存在 `yolov8s.pt`：
 
 - 会自动复制到资源目录后再加载
 
 这样可在首次启动后实现“资源独立于源码目录”的本地化落盘。
 
-兼容性说明：若 `yolo26n.pt` 不存在，会回退尝试 `yolov8n.pt`（若存在）。
+兼容性说明：若 `yolov8s.pt` 不存在，会依次回退尝试 `yolo26n.pt`、`yolov8n.pt`（若存在）。

@@ -14,6 +14,36 @@ from app_config import load_settings
 
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_WINDOWS_EXTENDED_PATH_THRESHOLD = 240
+
+
+def filesystem_path(path: Path, *, force_extended: bool = False) -> Path:
+    """
+    Return a path that is safe for local filesystem operations.
+
+    Windows still rejects many normal paths beyond ``MAX_PATH``. Dataset files
+    live under several UUID directories, so a perfectly valid user-selected
+    storage root can otherwise make uploads fail. Use the Win32 extended-path
+    form only for long absolute paths; database values and API responses remain
+    normal, portable relative paths.
+    """
+    expanded = path.expanduser()
+    if os.name != "nt":
+        return expanded
+
+    raw = str(expanded)
+    if raw.startswith("\\\\?\\"):
+        return expanded
+
+    if not expanded.is_absolute():
+        raw = str(expanded.resolve())
+
+    if not force_extended and len(raw) < _WINDOWS_EXTENDED_PATH_THRESHOLD:
+        return Path(raw)
+
+    if raw.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + raw.lstrip("\\"))
+    return Path("\\\\?\\" + raw)
 
 
 def legacy_storage_root() -> Path:
@@ -83,7 +113,7 @@ def dataset_dir(dataset_id: str, project_id: str | None = None, root: Path | Non
 
 
 def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+    filesystem_path(path).mkdir(parents=True, exist_ok=True)
 
 
 def safe_filename(filename: str, max_len: int = 200) -> str:
@@ -108,7 +138,7 @@ def save_upload_file(
 
     sha = hashlib.sha256()
     size = 0
-    with dest.open("wb") as f:
+    with filesystem_path(dest).open("wb") as f:
         while True:
             chunk = upload.file.read(1024 * 1024)
             if not chunk:
@@ -138,7 +168,7 @@ def save_bytes(
 
     sha = hashlib.sha256()
     sha.update(data)
-    with dest.open("wb") as f:
+    with filesystem_path(dest).open("wb") as f:
         f.write(data)
 
     if project_id:
@@ -168,7 +198,7 @@ def save_fileobj(
 
     sha = hashlib.sha256()
     size = 0
-    with dest.open("wb") as out:
+    with filesystem_path(dest).open("wb") as out:
         while True:
             chunk = fileobj.read(chunk_size)
             if not chunk:
@@ -189,7 +219,7 @@ def resolve_storage_path(rel_path: str, root: Path | None = None) -> Path:
     target = (base / rel_path).resolve()
     if base not in target.parents and target != base:
         raise ValueError("Invalid storage path")
-    return target
+    return filesystem_path(target)
 
 
 def delete_storage_path(rel_path: str, root: Path | None = None) -> None:

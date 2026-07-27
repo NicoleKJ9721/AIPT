@@ -13,7 +13,12 @@ from PIL import Image as PILImage
 os.environ.setdefault("AIPT_DATABASE_URL", "sqlite:///:memory:")
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import app  # noqa: E402
+import main as backend_main  # noqa: E402
+from main import TrainConfig, TrainJobStatusOut, app  # noqa: E402
+
+
+def test_default_transfer_model_is_yolov8s():
+    assert backend_main._resolve_train_model_arg(None).endswith("yolov8s.pt")
 
 
 def test_train_diagnostics_and_job_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -191,3 +196,35 @@ def test_train_incremental_requires_base_model_id(tmp_path: Path, monkeypatch: p
         resp = client.post("/train", json={"data": "coco128.yaml", "epochs": 1, "mode": "incremental", "project_id": "p"})
         assert resp.status_code == 400, resp.text
         assert "base_model_id" in (resp.json().get("message") or "")
+
+
+def test_real_train_failure_is_not_reported_as_mock_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AIPT_HOME_DIR", str(tmp_path / "aipt_home"))
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("AIPT_TRAIN_FORCE_MOCK", raising=False)
+    monkeypatch.setattr(backend_main, "import_yolo", lambda: (_ for _ in ()).throw(RuntimeError("ultralytics unavailable")))
+
+    job_id = "real-training-failure"
+    job_dir = tmp_path / "aipt_home" / "resources" / "training" / job_id
+    job = TrainJobStatusOut(
+        id=job_id,
+        status="queued",
+        created_at="2026-01-01T00:00:00+00:00",
+        log_path=str(job_dir / "train.log"),
+        config=TrainConfig(data="coco128.yaml", epochs=1, model="missing-model"),
+    )
+
+    with backend_main._TRAIN_JOBS_LOCK:
+        backend_main._TRAIN_JOBS[job_id] = job
+    backend_main._train_stop_event(job_id).clear()
+    try:
+        backend_main._run_training_job(job_id)
+        with backend_main._TRAIN_JOBS_LOCK:
+            result = backend_main._TRAIN_JOBS[job_id]
+        assert result.status == "failed"
+        assert "ultralytics unavailable" in (result.error or "")
+    finally:
+        with backend_main._TRAIN_JOBS_LOCK:
+            backend_main._TRAIN_JOBS.pop(job_id, None)
+        with backend_main._TRAIN_STOP_LOCK:
+            backend_main._TRAIN_STOP_EVENTS.pop(job_id, None)

@@ -5,7 +5,7 @@ import inspect
 from PIL import Image
 
 class ObjectDetector:
-    def __init__(self, model_path="yolo26n.pt"):
+    def __init__(self, model_path="yolov8s.pt"):
         try:
             from ultralytics import YOLO  # type: ignore
         except Exception as e:  # pragma: no cover

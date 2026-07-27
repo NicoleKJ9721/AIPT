@@ -121,6 +121,28 @@ def test_save_bytes_with_project_id_uses_project_root(tmp_path: Path):
     assert size == 3
     assert digest == sha256(b"abc").hexdigest()
 
+
+def test_save_bytes_supports_deep_storage_roots(tmp_path: Path):
+    # On Windows, the normal path to a dataset file can exceed MAX_PATH once
+    # the storage root and UUID-based project/dataset/file components are added.
+    deep_root = tmp_path / ("root-" + "a" * 120) / ("nested-" + "b" * 80)
+    project_id = f"p-{uuid4()}"
+    dataset_id = f"d-{uuid4()}"
+    file_id = f"f-{uuid4()}"
+
+    storage_rel, size, digest = save_bytes(
+        b"deep-path",
+        dataset_id=dataset_id,
+        file_id=file_id,
+        filename="image.png",
+        project_id=project_id,
+        root=deep_root,
+    )
+
+    assert size == len(b"deep-path")
+    assert digest == sha256(b"deep-path").hexdigest()
+    assert resolve_storage_path(storage_rel, root=deep_root).read_bytes() == b"deep-path"
+
 def test_save_upload_file_supports_non_project_datasets(tmp_path: Path):
     class DummyUpload:
         def __init__(self, filename: str, data: bytes):

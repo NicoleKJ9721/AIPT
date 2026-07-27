@@ -36,6 +36,44 @@ def test_annotation_to_yolo_lines_accepts_negative_rect_sizes():
     assert float(parts[4]) == pytest.approx(0.06, abs=1e-6)
 
 
+def test_annotation_to_yolo_lines_preserves_polygon_for_segment_task():
+    ann = Annotation(
+        image_id="img",
+        type="polygon",
+        label="defect",
+        color="#ef4444",
+        visible=True,
+        x=10.0,
+        y=20.0,
+        points=[0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0],
+    )
+
+    lines = _annotation_to_yolo_lines(ann, {"defect": 0}, img_w=100, img_h=100, task="segment")
+
+    assert len(lines) == 1
+    parts = lines[0].split()
+    assert parts == ["0", "0.100000", "0.200000", "0.200000", "0.200000", "0.200000", "0.300000", "0.100000", "0.300000"]
+
+
+def test_annotation_to_yolo_lines_converts_rect_to_polygon_for_segment_task():
+    ann = Annotation(
+        image_id="img",
+        type="rect",
+        label="defect",
+        color="#ef4444",
+        visible=True,
+        x=10.0,
+        y=20.0,
+        width=10.0,
+        height=10.0,
+    )
+
+    lines = _annotation_to_yolo_lines(ann, {"defect": 0}, img_w=100, img_h=100, task="segment")
+
+    assert len(lines) == 1
+    assert len(lines[0].split()) == 9
+
+
 def test_annotation_api_normalizes_negative_rect_sizes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("AIPT_HOME_DIR", str(tmp_path / "aipt_home"))
     monkeypatch.setenv("AIPT_API_KEY", "test-key")
@@ -106,4 +144,3 @@ def test_annotation_api_normalizes_negative_rect_sizes(tmp_path: Path, monkeypat
         assert cleanup_ds.status_code == 200, cleanup_ds.text
         cleanup_project = client.delete(f"/projects/{project_id}")
         assert cleanup_project.status_code == 204, cleanup_project.text
-

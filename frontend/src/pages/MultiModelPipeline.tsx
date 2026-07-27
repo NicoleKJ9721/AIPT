@@ -27,6 +27,11 @@ type StepDraft = {
   iou: number;
   max_det: number;
   classes: string;
+  input_roi_enabled: boolean;
+  input_roi_x: number;
+  input_roi_y: number;
+  input_roi_width: number;
+  input_roi_height: number;
   crop: boolean;
   crop_padding: number;
   crop_max_regions: number | null;
@@ -67,6 +72,11 @@ function newStepDraft(overrides?: Partial<StepDraft>): StepDraft {
     iou: overrides?.iou ?? 0.7,
     max_det: overrides?.max_det ?? 50,
     classes: overrides?.classes ?? "",
+    input_roi_enabled: overrides?.input_roi_enabled ?? false,
+    input_roi_x: overrides?.input_roi_x ?? 0,
+    input_roi_y: overrides?.input_roi_y ?? 0,
+    input_roi_width: overrides?.input_roi_width ?? 1,
+    input_roi_height: overrides?.input_roi_height ?? 1,
     crop: overrides?.crop ?? false,
     crop_padding: overrides?.crop_padding ?? 0.0,
     crop_max_regions: overrides?.crop_max_regions ?? null,
@@ -76,6 +86,42 @@ function newStepDraft(overrides?: Partial<StepDraft>): StepDraft {
     connector_padding: overrides?.connector_padding ?? 0.0,
     connector_max_regions: overrides?.connector_max_regions ?? null,
     connector_on_empty: overrides?.connector_on_empty ?? "stop",
+  };
+}
+
+function toPipelineStepPayload(step: StepDraft, index: number): PipelineStepSpecRecord {
+  const x = clamp(Number(step.input_roi_x) || 0, 0, 0.999);
+  const y = clamp(Number(step.input_roi_y) || 0, 0, 0.999);
+  const width = clamp(Number(step.input_roi_width) || 0, 0.001, 1 - x);
+  const height = clamp(Number(step.input_roi_height) || 0, 0.001, 1 - y);
+
+  return {
+    id: step.id,
+    title: step.title.trim() || "检测节点",
+    model_id: step.model_id || "",
+    conf: clamp(step.conf, 0, 1),
+    iou: clamp(step.iou, 0, 1),
+    max_det: Math.trunc(clamp(step.max_det, 1, 300)),
+    classes: parseClasses(step.classes),
+    // A fixed inspection ROI is intentionally a pipeline-input property, not a
+    // per-crop transform. Persist it on step 1 to keep existing recipe storage compatible.
+    input_roi:
+      index === 0 && step.input_roi_enabled
+        ? { x, y, width, height }
+        : null,
+    connector: step.crop
+      ? {
+          source: step.connector_source,
+          min_conf: clamp(step.connector_min_conf, 0, 1),
+          classes: parseClasses(step.connector_classes),
+          padding: clamp(step.connector_padding, 0, 1),
+          max_regions: step.connector_max_regions ?? null,
+          on_empty: step.connector_on_empty,
+        }
+      : null,
+    crop: step.crop,
+    crop_padding: clamp(step.connector_padding, 0, 1),
+    crop_max_regions: step.connector_max_regions ?? null,
   };
 }
 
@@ -117,6 +163,26 @@ export default function MultiModelPipeline() {
   );
 
   const selectedStep = useMemo(() => steps.find((s) => s.id === selectedStepId) ?? null, [steps, selectedStepId]);
+  const selectedStepIndex = useMemo(() => steps.findIndex((s) => s.id === selectedStepId), [steps, selectedStepId]);
+
+  const updateInputRoi = useCallback(
+    (
+      patch: Partial<
+        Pick<StepDraft, "input_roi_enabled" | "input_roi_x" | "input_roi_y" | "input_roi_width" | "input_roi_height">
+      >
+    ) => {
+      setSteps((prev) => {
+        if (!prev[0]) return prev;
+        const raw = { ...prev[0], ...patch };
+        const x = clamp(Number(raw.input_roi_x) || 0, 0, 0.999);
+        const y = clamp(Number(raw.input_roi_y) || 0, 0, 0.999);
+        const width = clamp(Number(raw.input_roi_width) || 0.001, 0.001, 1 - x);
+        const height = clamp(Number(raw.input_roi_height) || 0.001, 0.001, 1 - y);
+        return [{ ...raw, input_roi_x: x, input_roi_y: y, input_roi_width: width, input_roi_height: height }, ...prev.slice(1)];
+      });
+    },
+    []
+  );
 
   const loadProjects = useCallback(async () => {
     try {
@@ -265,6 +331,11 @@ export default function MultiModelPipeline() {
         iou: typeof s.iou === "number" ? s.iou : 0.7,
         max_det: typeof s.max_det === "number" ? s.max_det : 50,
         classes: Array.isArray(s.classes) ? s.classes.join(",") : "",
+        input_roi_enabled: Boolean(s.input_roi),
+        input_roi_x: typeof s.input_roi?.x === "number" ? s.input_roi.x : 0,
+        input_roi_y: typeof s.input_roi?.y === "number" ? s.input_roi.y : 0,
+        input_roi_width: typeof s.input_roi?.width === "number" ? s.input_roi.width : 1,
+        input_roi_height: typeof s.input_roi?.height === "number" ? s.input_roi.height : 1,
         crop: Boolean(s.connector) || Boolean(s.crop),
         crop_padding: typeof s.crop_padding === "number" ? s.crop_padding : 0.0,
         crop_max_regions: typeof s.crop_max_regions === "number" ? s.crop_max_regions : null,
@@ -313,28 +384,7 @@ export default function MultiModelPipeline() {
       }
     }
 
-    const payloadSteps: PipelineStepSpecRecord[] = steps.map((s) => ({
-      id: s.id,
-      title: s.title.trim() || "检测节点",
-      model_id: s.model_id || "",
-      conf: clamp(s.conf, 0, 1),
-      iou: clamp(s.iou, 0, 1),
-      max_det: Math.trunc(clamp(s.max_det, 1, 300)),
-      classes: parseClasses(s.classes),
-      connector: s.crop
-        ? {
-            source: s.connector_source,
-            min_conf: clamp(s.connector_min_conf, 0, 1),
-            classes: parseClasses(s.connector_classes),
-            padding: clamp(s.connector_padding, 0, 1),
-            max_regions: s.connector_max_regions ?? null,
-            on_empty: s.connector_on_empty,
-          }
-        : null,
-      crop: s.crop,
-      crop_padding: clamp(s.connector_padding, 0, 1),
-      crop_max_regions: s.connector_max_regions ?? null,
-    }));
+    const payloadSteps = steps.map(toPipelineStepPayload);
 
     try {
       setIsSaving(true);
@@ -373,28 +423,7 @@ export default function MultiModelPipeline() {
       }
     }
 
-    const payloadSteps: PipelineStepSpecRecord[] = steps.map((s) => ({
-      id: s.id,
-      title: s.title.trim() || "检测节点",
-      model_id: s.model_id || "",
-      conf: clamp(s.conf, 0, 1),
-      iou: clamp(s.iou, 0, 1),
-      max_det: Math.trunc(clamp(s.max_det, 1, 300)),
-      classes: parseClasses(s.classes),
-      connector: s.crop
-        ? {
-            source: s.connector_source,
-            min_conf: clamp(s.connector_min_conf, 0, 1),
-            classes: parseClasses(s.connector_classes),
-            padding: clamp(s.connector_padding, 0, 1),
-            max_regions: s.connector_max_regions ?? null,
-            on_empty: s.connector_on_empty,
-          }
-        : null,
-      crop: s.crop,
-      crop_padding: clamp(s.connector_padding, 0, 1),
-      crop_max_regions: s.connector_max_regions ?? null,
-    }));
+    const payloadSteps = steps.map(toPipelineStepPayload);
 
     try {
       setIsRunning(true);
@@ -606,6 +635,11 @@ export default function MultiModelPipeline() {
                                 Connector: {node.connector_source === "prev_segments" ? "Seg ROI" : "Det ROI"}
                               </Badge>
                             ) : null}
+                            {node.input_roi_enabled ? (
+                              <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700">
+                                Fixed ROI
+                              </Badge>
+                            ) : null}
                           </div>
                         </div>
 
@@ -666,6 +700,19 @@ export default function MultiModelPipeline() {
               {inputUrl && inputSize ? (
                 <svg ref={svgRef} viewBox={`0 0 ${inputSize.w} ${inputSize.h}`} className="absolute inset-0 h-full w-full">
                   <image href={inputUrl} x="0" y="0" width={inputSize.w} height={inputSize.h} preserveAspectRatio="xMidYMid meet" />
+                  {steps[0]?.input_roi_enabled ? (
+                    <rect
+                      x={steps[0].input_roi_x * inputSize.w}
+                      y={steps[0].input_roi_y * inputSize.h}
+                      width={steps[0].input_roi_width * inputSize.w}
+                      height={steps[0].input_roi_height * inputSize.h}
+                      fill="rgba(245, 158, 11, 0.10)"
+                      stroke="#d97706"
+                      strokeWidth={2}
+                      strokeDasharray="8 5"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  ) : null}
                   {displayDetections.map((d, idx) => {
                     const [x1, y1, x2, y2] = d.bbox;
                     const w = Math.max(0, x2 - x1);
@@ -788,6 +835,86 @@ export default function MultiModelPipeline() {
                       </SelectContent>
                     </Select>
                   </div>
+
+                  {selectedStepIndex === 0 ? (
+                    <>
+                      <div className="h-px w-full bg-border" />
+                      <div className="flex items-center justify-between rounded-lg border border-amber-500/30 bg-amber-50/40 p-3 dark:bg-amber-950/10">
+                        <div className="space-y-0.5">
+                          <Label className="text-sm">固定工位 ROI（不改原图）</Label>
+                          <div className="text-xs text-muted-foreground">先裁出稳定的检测区域；后续框和热图仍映射回原图坐标。</div>
+                        </div>
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 rounded border-gray-300 text-amber-600 focus:ring-amber-600"
+                          checked={selectedStep.input_roi_enabled}
+                          onChange={(e) => updateInputRoi({ input_roi_enabled: e.target.checked })}
+                        />
+                      </div>
+                      {selectedStep.input_roi_enabled ? (
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="space-y-2">
+                            <Label className="text-xs text-muted-foreground">左上 X（%）</Label>
+                            <Input
+                              type="number"
+                              step="0.1"
+                              min="0"
+                              max="99.9"
+                              value={Number((selectedStep.input_roi_x * 100).toFixed(3))}
+                              onChange={(e) => updateInputRoi({ input_roi_x: Number(e.target.value) / 100 })}
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-xs text-muted-foreground">左上 Y（%）</Label>
+                            <Input
+                              type="number"
+                              step="0.1"
+                              min="0"
+                              max="99.9"
+                              value={Number((selectedStep.input_roi_y * 100).toFixed(3))}
+                              onChange={(e) => updateInputRoi({ input_roi_y: Number(e.target.value) / 100 })}
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-xs text-muted-foreground">宽度（%）</Label>
+                            <Input
+                              type="number"
+                              step="0.1"
+                              min="0.1"
+                              max="100"
+                              value={Number((selectedStep.input_roi_width * 100).toFixed(3))}
+                              onChange={(e) => updateInputRoi({ input_roi_width: Number(e.target.value) / 100 })}
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-xs text-muted-foreground">高度（%）</Label>
+                            <Input
+                              type="number"
+                              step="0.1"
+                              min="0.1"
+                              max="100"
+                              value={Number((selectedStep.input_roi_height * 100).toFixed(3))}
+                              onChange={(e) => updateInputRoi({ input_roi_height: Number(e.target.value) / 100 })}
+                            />
+                          </div>
+                          <div className="col-span-2 flex justify-end">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => updateInputRoi({ input_roi_x: 0, input_roi_y: 0, input_roi_width: 1, input_roi_height: 1 })}
+                            >
+                              重置为全图
+                            </Button>
+                          </div>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
+                      固定工位 ROI 仅在首节点配置；本节点可使用上一节点的动态 ROI。
+                    </div>
+                  )}
 
                   <div className="h-px w-full bg-border" />
 

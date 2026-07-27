@@ -15,6 +15,7 @@ from db_models import Project, TrainedModel
 from schemas import (
     ModelEvaluationDetectionOut,
     PipelineConnectorSpec,
+    PipelineInputRoiSpec,
     PipelineRunOut,
     PipelineRunStepOut,
     PipelineStepSpec,
@@ -138,6 +139,27 @@ def _step_connector(step: PipelineStepSpec) -> PipelineConnectorSpec | None:
     return _legacy_connector_from_crop(step)
 
 
+def _input_roi_context(image: Image.Image, roi: PipelineInputRoiSpec) -> tuple[_Ctx, str]:
+    """Crop a fixed inspection area once, while retaining original-image coordinates."""
+    width, height = image.size
+    x1 = int(round(float(roi.x) * width))
+    y1 = int(round(float(roi.y) * height))
+    x2 = int(round(float(roi.x + roi.width) * width))
+    y2 = int(round(float(roi.y + roi.height) * height))
+
+    x1 = max(0, min(width, x1))
+    y1 = max(0, min(height, y1))
+    x2 = max(0, min(width, x2))
+    y2 = max(0, min(height, y2))
+    if x2 <= x1 or y2 <= y1:
+        raise HTTPException(status_code=422, detail="input_roi is smaller than one source pixel")
+
+    return (
+        _Ctx(img=image.crop((x1, y1, x2, y2)), offset_x=float(x1), offset_y=float(y1)),
+        f"Fixed input ROI applied: ({x1}, {y1})–({x2}, {y2}).",
+    )
+
+
 def _safe_class_name(names: dict[int, str] | None, cls_id: int, fallback: str = "object") -> str:
     if names and cls_id in names:
         return str(names.get(cls_id))
@@ -167,7 +189,14 @@ def run_pipeline_steps(
         raise HTTPException(status_code=404, detail="Project not found")
     project_root = project_storage_root(project.storage_root)
 
+    if any(step.input_roi is not None for step in steps[1:]):
+        raise HTTPException(status_code=422, detail="input_roi is only supported on the first pipeline step")
+
     root_ctx = _Ctx(img=image, offset_x=0.0, offset_y=0.0)
+    input_roi_note: str | None = None
+    if steps and steps[0].input_roi is not None:
+        root_ctx, input_roi_note = _input_roi_context(image, steps[0].input_roi)
+
     ctxs: list[_Ctx] = [root_ctx]
     out_steps: list[PipelineRunStepOut] = []
     note: str | None = None
@@ -209,7 +238,7 @@ def run_pipeline_steps(
         local_seg_regions: list[_Region] = []
 
         started = time.perf_counter()
-        step_note: str | None = None
+        step_note: str | None = input_roi_note if idx == 0 else None
 
         with cached.lock:
             for ctx in ctxs:
@@ -227,7 +256,7 @@ def run_pipeline_steps(
                             results = model_obj(ctx.img, **safe_kwargs)  # type: ignore[misc]
                 except Exception as exc:
                     logger.debug("Pipeline predict failed (model_id=%s step=%s): %s", step.model_id, step.id, exc, exc_info=True)
-                    step_note = str(exc)
+                    step_note = "; ".join(part for part in (step_note, str(exc)) if part)
                     continue
 
                 for result in results:
@@ -387,7 +416,7 @@ def run_pipeline_steps(
         if connector.on_empty == "fallback_full":
             ctxs = [root_ctx]
             if note is None:
-                note = f"Step '{step.title}' produced no connector regions; fallback to full image."
+                note = f"Step '{step.title}' produced no connector regions; fallback to configured input region."
             continue
 
         if connector.on_empty == "skip":

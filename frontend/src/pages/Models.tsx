@@ -67,12 +67,19 @@ const DEFAULT_EVAL_PARAMS: EvalParams = {
 };
 
 const YOLO_MODELS = [
+  { value: "yolov8n", label: "YOLOv8n (Nano)" },
+  { value: "yolov8s", label: "YOLOv8s (Small，工业缺陷实测默认)" },
   { value: "yolo26n", label: "YOLO26n (Nano)" },
   { value: "yolo26s", label: "YOLO26s (Small)" },
   { value: "yolo26m", label: "YOLO26m (Medium)" },
   { value: "yolo26l", label: "YOLO26l (Large)" },
   { value: "yolo26x", label: "YOLO26x (X-Large)" },
 ] as const;
+
+function modelForTask(model: string | undefined, task: "detect" | "segment") {
+  const base = (model || "yolov8s").trim().replace(/-seg$/i, "");
+  return task === "segment" ? `${base}-seg` : base;
+}
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -332,8 +339,9 @@ export default function Models() {
     batch: 16,
     imgsz: 640,
     lr0: 0.01,
-    model: "yolo26m",
+    model: "yolov8s",
     mode: "transfer",
+    task: "detect",
     output_name: "",
     base_model_id: null,
   });
@@ -372,6 +380,9 @@ export default function Models() {
     if (!primaryDeviceId) return null;
     return hardwareList.find((d) => d.id === primaryDeviceId) ?? null;
   }, [hardwareList, primaryDeviceId]);
+
+  const trainTask = trainConfig.task ?? "detect";
+  const selectedTrainModel = modelForTask(trainConfig.model, trainTask);
 
   const recommended = useMemo(() => {
     if (!datasetStats) return null;
@@ -729,11 +740,12 @@ export default function Models() {
         imgsz: trainConfig.imgsz,
         lr0: trainConfig.lr0,
         mode,
+        task: trainTask,
         output_name: (trainConfig.output_name || "").trim() || null,
         project_id: activeProjectId,
         dataset_id: activeDatasetId,
         device: device ?? null,
-        ...(mode === "transfer" ? { model: trainConfig.model || "yolo26m" } : { base_model_id: baseModelId }),
+        ...(mode === "transfer" ? { model: selectedTrainModel } : { base_model_id: baseModelId }),
       };
       const response = await aiService.train(payload);
       toast({ title: "训练已启动", description: response.message });
@@ -1597,7 +1609,7 @@ export default function Models() {
             <div className="flex items-center justify-between gap-4">
               <div>
                 <CardTitle>训练参数</CardTitle>
-                <CardDescription>默认 YOLO26m；推荐参数基于硬件与数据集规模</CardDescription>
+                <CardDescription>默认 YOLOv8s；推荐参数基于硬件与数据集规模</CardDescription>
               </div>
               <Button
                 variant="outline"
@@ -1621,7 +1633,42 @@ export default function Models() {
             <form className="space-y-4">
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">训练类型</label>
+                  <label className="text-sm font-medium">任务类型</label>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant={trainTask === "detect" ? "default" : "outline"}
+                      onClick={() =>
+                        setTrainConfig((prev) => ({
+                          ...prev,
+                          task: "detect",
+                          model: modelForTask(prev.model, "detect"),
+                        }))
+                      }
+                    >
+                      目标检测
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={trainTask === "segment" ? "default" : "outline"}
+                      onClick={() =>
+                        setTrainConfig((prev) => ({
+                          ...prev,
+                          task: "segment",
+                          model: modelForTask(prev.model, "segment"),
+                        }))
+                      }
+                    >
+                      实例分割
+                    </Button>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    实例分割会保留智能标注产生的多边形；目标检测会导出其外接框。
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">训练方式</label>
                   <div className="flex flex-wrap gap-2">
                     <Button
                       type="button"
@@ -1651,7 +1698,7 @@ export default function Models() {
                     </Button>
                   </div>
                   <div className="text-xs text-muted-foreground">
-                    迁移训练：从 YOLO26 预训练开始；增量训练：从历史项目模型继续训练（生成新版本）。
+                    迁移训练：从所选预训练模型开始；增量训练：从历史项目模型继续训练（生成新版本）。
                   </div>
                 </div>
 
@@ -1668,15 +1715,15 @@ export default function Models() {
 
               {(trainConfig.mode ?? "transfer") === "transfer" ? (
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">预训练模型（YOLO26）</label>
+                  <label className="text-sm font-medium">预训练模型（{trainTask === "segment" ? "分割" : "检测"}）</label>
                   <select
                     className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                    value={trainConfig.model ?? "yolo26m"}
-                    onChange={(e) => setTrainConfig({ ...trainConfig, model: e.target.value })}
+                    value={selectedTrainModel}
+                    onChange={(e) => setTrainConfig({ ...trainConfig, model: modelForTask(e.target.value, trainTask) })}
                   >
                     {YOLO_MODELS.map((m) => (
-                      <option key={m.value} value={m.value}>
-                        {m.label}
+                      <option key={m.value} value={modelForTask(m.value, trainTask)}>
+                        {m.label}{trainTask === "segment" ? " Segmentation" : ""}
                       </option>
                     ))}
                   </select>
@@ -1704,7 +1751,7 @@ export default function Models() {
                     })}
                   </select>
                   <div className="text-xs text-muted-foreground">
-                    增量训练将从所选模型继续训练，不提供 YOLO26 预训练选择。
+                    增量训练将从所选模型继续训练，不提供通用预训练模型选择。
                   </div>
                 </div>
               )}

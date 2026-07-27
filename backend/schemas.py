@@ -302,6 +302,21 @@ PipelineConnectorSource = Literal["prev_detections", "prev_segments"]
 PipelineConnectorOnEmpty = Literal["stop", "fallback_full", "skip"]
 
 
+class PipelineInputRoiSpec(BaseModel):
+    """A non-destructive, normalized inspection area applied before pipeline step 1."""
+
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+    width: float = Field(gt=0.0, le=1.0)
+    height: float = Field(gt=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _fits_inside_image(self) -> "PipelineInputRoiSpec":
+        if self.x + self.width > 1.0 + 1e-9 or self.y + self.height > 1.0 + 1e-9:
+            raise ValueError("input_roi must fit inside normalized image bounds")
+        return self
+
+
 class PipelineConnectorSpec(BaseModel):
     source: PipelineConnectorSource = "prev_detections"
     min_conf: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -322,6 +337,10 @@ class PipelineStepSpec(BaseModel):
 
     # Optional class filters. Supports int IDs and/or string names (resolved by the model's names mapping).
     classes: list[int | str] | None = None
+
+    # A station-fixed ROI, saved on the first step and applied once to the pipeline input.
+    # Coordinates are normalized so a recipe can be reused across image resolutions.
+    input_roi: PipelineInputRoiSpec | None = None
 
     # Preferred connector config (new).
     connector: PipelineConnectorSpec | None = None

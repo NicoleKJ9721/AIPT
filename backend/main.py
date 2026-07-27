@@ -44,7 +44,9 @@ from model import ObjectDetector
 from storage import (
     delete_storage_path,
     default_storage_root,
+    ensure_dir,
     ensure_project_dirs,
+    filesystem_path,
     project_storage_root,
     resolve_storage_path,
     safe_filename,
@@ -100,7 +102,7 @@ detector = None
 def _default_model_weights_path() -> Path | None:
     """
     Local-first: prefer weights under the configured resources directory.
-    If missing, seed from the repo root `yolo26n.pt` when available.
+    If missing, seed from the repo root `yolov8s.pt` when available.
     """
     try:
         settings = load_settings()
@@ -109,8 +111,9 @@ def _default_model_weights_path() -> Path | None:
         resources_root = None  # type: ignore[assignment]
 
     repo_root = Path(__file__).resolve().parents[1]
-    repo_weights = (repo_root / "yolo26n.pt").resolve()
-    repo_fallback = (repo_root / "yolov8n.pt").resolve()
+    repo_weights = (repo_root / "yolov8s.pt").resolve()
+    repo_fallback = (repo_root / "yolo26n.pt").resolve()
+    repo_legacy_fallback = (repo_root / "yolov8n.pt").resolve()
 
     if resources_root:
         models_dir = resources_root / "models"
@@ -120,7 +123,7 @@ def _default_model_weights_path() -> Path | None:
             models_dir = None  # type: ignore[assignment]
 
         if models_dir:
-            seeded = (models_dir / "yolo26n.pt").resolve()
+            seeded = (models_dir / "yolov8s.pt").resolve()
             if seeded.exists():
                 return seeded
             if repo_weights.exists():
@@ -131,12 +134,20 @@ def _default_model_weights_path() -> Path | None:
                     return repo_weights
             if repo_fallback.exists():
                 try:
-                    fallback_seeded = (models_dir / "yolov8n.pt").resolve()
+                    fallback_seeded = (models_dir / "yolo26n.pt").resolve()
                     if not fallback_seeded.exists():
                         shutil.copy2(repo_fallback, fallback_seeded)
                     return fallback_seeded
                 except Exception:
                     return repo_fallback
+            if repo_legacy_fallback.exists():
+                try:
+                    legacy_seeded = (models_dir / "yolov8n.pt").resolve()
+                    if not legacy_seeded.exists():
+                        shutil.copy2(repo_legacy_fallback, legacy_seeded)
+                    return legacy_seeded
+                except Exception:
+                    return repo_legacy_fallback
 
     if repo_weights.exists():
         return repo_weights
@@ -151,13 +162,13 @@ def _resolve_train_model_arg(model: str | None) -> str:
     Resolve a YOLO model identifier to a local weights path when possible.
 
     - If `model` is a local file path and exists, return it.
-    - If `model` is a stem like "yolo26m", prefer `<resources_root>/models/yolo26m.pt`,
+    - If `model` is a stem like "yolov8s", prefer `<resources_root>/models/yolov8s.pt`,
       seeding from the repo root when available.
     - Otherwise, return the original value (letting ultralytics resolve/download).
     """
     raw = (model or "").strip()
     if not raw:
-        raw = "yolo26m.pt"
+        raw = "yolov8s.pt"
 
     try:
         p = Path(raw)
@@ -288,6 +299,7 @@ class TrainConfig(BaseModel):
     lr0: float | None = None
     model: str | None = None
     mode: Literal["transfer", "incremental"] = "transfer"
+    task: Literal["detect", "segment"] = "detect"
     output_name: str | None = None
     base_model_id: str | None = None
     device: str | None = None
@@ -665,6 +677,9 @@ def _resources_root_dir() -> Path:
 
 
 def _remove_tree(path: Path, *, what: str) -> None:
+    # The root itself may be short while a nested dataset UUID + filename is
+    # not. Force the extended form so shutil keeps it for every child path.
+    path = filesystem_path(path, force_extended=True)
     if not path.exists():
         return
     try:
@@ -964,11 +979,18 @@ def _resolve_dataset_id(cfg: TrainConfig) -> str | None:
     return None
 
 
-def _annotation_to_yolo_lines(ann: Annotation, class_index: dict[str, int], img_w: int, img_h: int) -> list[str]:
+def _annotation_to_yolo_lines(
+    ann: Annotation,
+    class_index: dict[str, int],
+    img_w: int,
+    img_h: int,
+    task: Literal["detect", "segment"] = "detect",
+) -> list[str]:
     label = str(getattr(ann, "label", "")).strip()
-    if not label or label not in class_index:
+    if not label or label not in class_index or img_w <= 0 or img_h <= 0:
         return []
 
+    polygon_points: list[tuple[float, float]] | None = None
     if ann.type == "rect":
         x = float(ann.x or 0)
         y = float(ann.y or 0)
@@ -981,6 +1003,7 @@ def _annotation_to_yolo_lines(ann: Annotation, class_index: dict[str, int], img_
         y1 = min(y, y + h)
         x2 = max(x, x + w)
         y2 = max(y, y + h)
+        polygon_points = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
     elif ann.type == "polygon" and ann.points:
         pts = list(ann.points or [])
         if len(pts) < 6 or len(pts) % 2 != 0:
@@ -989,6 +1012,7 @@ def _annotation_to_yolo_lines(ann: Annotation, class_index: dict[str, int], img_
         oy = float(ann.y or 0)
         xs = [float(pts[i]) + ox for i in range(0, len(pts), 2)]
         ys = [float(pts[i]) + oy for i in range(1, len(pts), 2)]
+        polygon_points = list(zip(xs, ys))
         x1, x2 = min(xs), max(xs)
         y1, y2 = min(ys), max(ys)
     else:
@@ -1003,11 +1027,26 @@ def _annotation_to_yolo_lines(ann: Annotation, class_index: dict[str, int], img_
     if bw <= 1 or bh <= 1:
         return []
 
+    cls = int(class_index[label])
+    if task == "segment":
+        if not polygon_points:
+            return []
+        clipped_points = [
+            (
+                max(0.0, min(float(img_w), px)),
+                max(0.0, min(float(img_h), py)),
+            )
+            for px, py in polygon_points
+        ]
+        if len(set(clipped_points)) < 3:
+            return []
+        normalized = " ".join(f"{px / float(img_w):.6f} {py / float(img_h):.6f}" for px, py in clipped_points)
+        return [f"{cls} {normalized}"]
+
     xc = (x1 + x2) / 2.0 / float(img_w)
     yc = (y1 + y2) / 2.0 / float(img_h)
     bw_n = bw / float(img_w)
     bh_n = bh / float(img_h)
-    cls = int(class_index[label])
     return [f"{cls} {xc:.6f} {yc:.6f} {bw_n:.6f} {bh_n:.6f}"]
 
 
@@ -1034,7 +1073,11 @@ def _normalize_rect_payload(ann_data: dict) -> None:
     ann_data["height"] = y2 - y1
 
 
-def _prepare_yolo_dataset(dataset_id: str, job_dir: Path) -> Path:
+def _prepare_yolo_dataset(
+    dataset_id: str,
+    job_dir: Path,
+    task: Literal["detect", "segment"] = "detect",
+) -> Path:
     """
     Materialize a YOLO-format dataset under `<job_dir>/dataset/` and return `data.yaml`.
     """
@@ -1142,7 +1185,7 @@ def _prepare_yolo_dataset(dataset_id: str, job_dir: Path) -> Path:
             )
             lines: list[str] = []
             for ann in anns:
-                lines.extend(_annotation_to_yolo_lines(ann, class_index, img_w, img_h))
+                lines.extend(_annotation_to_yolo_lines(ann, class_index, img_w, img_h, task=task))
             dst_lbl.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
     yaml_path = ds_root / "data.yaml"
@@ -1226,7 +1269,7 @@ def _persist_trained_model(job_id: str, cfg: TrainConfig, job_dir: Path) -> None
             if candidate and candidate.project_id == project_id:
                 parent = candidate
 
-        model_name_hint = Path(cfg.model or (parent.base_model if parent else "yolo26m")).stem or "model"
+        model_name_hint = Path(cfg.model or (parent.base_model if parent else "yolov8s")).stem or "model"
 
         desired_name = (cfg.output_name or "").strip()
         if desired_name:
@@ -1246,8 +1289,8 @@ def _persist_trained_model(job_id: str, cfg: TrainConfig, job_dir: Path) -> None
         ):
             model_name = f"{model_name}-{ts}"
 
-        model_dir = (project_root / "projects" / project_id / "models" / model_id).resolve()
-        model_dir.mkdir(parents=True, exist_ok=True)
+        model_dir = filesystem_path((project_root / "projects" / project_id / "models" / model_id).resolve())
+        ensure_dir(model_dir)
         shutil.copy2(weights_src, model_dir / "best.pt")
 
         weights_rel = (Path("projects") / project_id / "models" / model_id / "best.pt").as_posix()
@@ -1266,7 +1309,7 @@ def _persist_trained_model(job_id: str, cfg: TrainConfig, job_dir: Path) -> None
             except Exception:
                 logger.debug("Failed to summarize metrics for trained model (job_id=%s)", job_id, exc_info=True)
 
-        base_model = parent.base_model if parent else (model_name_hint or (cfg.model or "yolo26m"))
+        base_model = parent.base_model if parent else (model_name_hint or (cfg.model or "yolov8s"))
 
         rec = TrainedModel(
             id=model_id,
@@ -1328,26 +1371,34 @@ def _run_training_job(job_id: str, resume: bool = False) -> None:
         data_yaml: str = cfg.data
         if dataset_id:
             write_log(f"[train] preparing YOLO dataset for dataset_id={dataset_id}")
-            yaml_path = _prepare_yolo_dataset(dataset_id, Path(job.log_path).parent)
+            yaml_path = _prepare_yolo_dataset(dataset_id, Path(job.log_path).parent, task=cfg.task)
             data_yaml = str(yaml_path)
             write_log(f"[train] dataset_yaml={data_yaml}")
 
-        # Try real training when ultralytics is available; otherwise fall back to a lightweight mock.
-        try:
-            force_mock = bool(os.getenv("PYTEST_CURRENT_TEST")) or str(os.getenv("AIPT_TRAIN_FORCE_MOCK") or "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-            )
-            if force_mock:
-                raise RuntimeError("forced mock training")
+        force_mock = bool(os.getenv("PYTEST_CURRENT_TEST")) or str(os.getenv("AIPT_TRAIN_FORCE_MOCK") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if force_mock:
+            write_log("[train] mock training enabled by test or AIPT_TRAIN_FORCE_MOCK")
+            # Mock progress is reserved for explicit test/development use only.
+            for epoch in range(int(cfg.epochs or 1)):
+                if stop_evt.is_set():
+                    break
+                loss = 1.0 / (1.0 + epoch)
+                write_log(f"Epoch {epoch + 1}/{cfg.epochs} box_loss={loss:.4f} cls_loss={loss:.4f} dfl_loss={loss:.4f}")
+                _set_train_job(job_id, lambda j: j.model_copy(update={"progress": (epoch + 1) / float(cfg.epochs or 1)}))
+                time.sleep(0.05)
+        else:
+            # Real training errors intentionally propagate to the outer handler so a failed run is never reported as completed.
 
             out_dir = (Path(job.log_path).parent / "runs").resolve()
             out_dir.mkdir(parents=True, exist_ok=True)
             write_log(f"[train] output_dir={out_dir}")
 
             write_log(
-                f"[train] mode={cfg.mode} base_model_id={(cfg.base_model_id or '').strip()} output_name={(cfg.output_name or '').strip()}"
+                f"[train] mode={cfg.mode} task={cfg.task} base_model_id={(cfg.base_model_id or '').strip()} output_name={(cfg.output_name or '').strip()}"
             )
 
             model_arg: str
@@ -1440,6 +1491,7 @@ def _run_training_job(job_id: str, resume: bool = False) -> None:
             with log_path.open("a", encoding="utf-8") as f, redirect_stdout(f), redirect_stderr(f):
                 train_kwargs: dict[str, object] = {
                     "data": data_yaml,
+                    "task": cfg.task,
                     "epochs": int(cfg.epochs),
                     "imgsz": int(cfg.imgsz),
                     "batch": int(cfg.batch),
@@ -1461,23 +1513,13 @@ def _run_training_job(job_id: str, resume: bool = False) -> None:
                     train_kwargs["workers"] = int(cfg.workers)
                 if cfg.cache is not None:
                     train_kwargs["cache"] = cfg.cache
-
                 yolo.train(**filter_kwargs_by_signature(yolo.train, train_kwargs))
-        except Exception as exc:
-            write_log(f"[train] ultralytics training unavailable, falling back to mock run: {exc}")
-            # Mock progress: prints loss-like lines so UI can validate "loss updates".
-            for epoch in range(int(cfg.epochs or 1)):
-                if stop_evt.is_set():
-                    break
-                loss = 1.0 / (1.0 + epoch)
-                write_log(f"Epoch {epoch + 1}/{cfg.epochs} box_loss={loss:.4f} cls_loss={loss:.4f} dfl_loss={loss:.4f}")
-                _set_train_job(job_id, lambda j: j.model_copy(update={"progress": (epoch + 1) / float(cfg.epochs or 1)}))
-                time.sleep(0.05)
 
-        try:
-            _persist_trained_model(job_id, cfg, Path(job.log_path).parent)
-        except Exception:
-            logger.debug("Failed to persist trained model (job_id=%s)", job_id, exc_info=True)
+        if not stop_evt.is_set():
+            try:
+                _persist_trained_model(job_id, cfg, Path(job.log_path).parent)
+            except Exception:
+                logger.debug("Failed to persist trained model (job_id=%s)", job_id, exc_info=True)
 
         if stop_evt.is_set():
             _set_train_job(
@@ -2325,8 +2367,8 @@ def clone_dataset(
         new_file_id = str(uuid.uuid4())
         stored_name = f"{new_file_id}__{safe_filename(file.filename)}"
         rel = (Path("projects") / project_id / "datasets" / dst_id / stored_name).as_posix()
-        dst_path = (project_root / rel).resolve()
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        dst_path = filesystem_path((project_root / rel).resolve())
+        ensure_dir(dst_path.parent)
 
         try:
             shutil.copy2(src_path, dst_path)
@@ -2795,7 +2837,7 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
 
     storage_root_value = str(Path(str(storage_root_value)).expanduser().resolve())
     try:
-        Path(storage_root_value).mkdir(parents=True, exist_ok=True)
+        ensure_dir(Path(storage_root_value))
     except Exception:
         logger.debug("Failed to create project storage root dir (%s)", storage_root_value, exc_info=True)
 
@@ -4211,8 +4253,8 @@ def export_trained_model(
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=503, detail=f"ultralytics is not available: {exc}") from exc
 
-    export_base = (project_root / "projects" / rec.project_id / "exports").resolve()
-    export_base.mkdir(parents=True, exist_ok=True)
+    export_base = filesystem_path((project_root / "projects" / rec.project_id / "exports").resolve())
+    ensure_dir(export_base)
     tmp_dir = Path(tempfile.mkdtemp(prefix=f"export_{rec.id}_", dir=str(export_base))).resolve()
 
     cleanup: list[str] = [str(tmp_dir)]

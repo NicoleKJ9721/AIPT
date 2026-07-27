@@ -50,6 +50,7 @@ export interface TrainConfig {
   lr0?: number;
   model?: string;
   mode?: "transfer" | "incremental";
+  task?: "detect" | "segment";
   output_name?: string | null;
   base_model_id?: string | null;
   device?: string | null;
@@ -340,6 +341,13 @@ export interface PipelineConnectorSpecRecord {
   on_empty?: "stop" | "fallback_full" | "skip";
 }
 
+export interface PipelineInputRoiSpecRecord {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface PipelineStepSpecRecord {
   id: string;
   title: string;
@@ -348,6 +356,7 @@ export interface PipelineStepSpecRecord {
   iou?: number;
   max_det?: number;
   classes?: Array<number | string> | null;
+  input_roi?: PipelineInputRoiSpecRecord | null;
   connector?: PipelineConnectorSpecRecord | null;
   crop?: boolean;
   crop_padding?: number;
